@@ -4,7 +4,9 @@
 
 將原本小智 AI 的多進程雙系統架構，完整移植為 **NAT 自定義元件**——15 個 Python 模組、0 行 NAT 原始碼修改、1 份統一 YAML 配置，以 `pip install` 套件形式獨立運作。
 
-**Demo 影片：** [NAT Voice Agent Demo](https://youtu.be/F58cTtn1T2I)
+### Demo
+
+[![NAT Voice Agent Demo](docs/demo-thumbnail.png)](https://youtu.be/F58cTtn1T2I)
 
 ## 為何移植到 NAT？
 
