@@ -37,8 +37,8 @@ dependencies = [
     "starlette",
     "numpy",
 
-    # Optional: VLM camera tool
-    "opencv-python",
+    # Optional: VLM camera tool (headless for Docker/server environments)
+    "opencv-python-headless",
 ]
 
 [project.entry-points.'nat.components']

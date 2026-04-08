@@ -9,10 +9,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ── System packages ──────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 python3.12-venv python3.12-dev python3-pip \
+        build-essential \
         libopus-dev libopus0 libsndfile1-dev \
         git curl ca-certificates tzdata \
     && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
