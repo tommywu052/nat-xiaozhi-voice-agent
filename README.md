@@ -1,5 +1,7 @@
 # Xiaozhi Voice Agent (NAT Plugin)
 
+[English](README_en.md) | **繁體中文**
+
 基於 NVIDIA NeMo Agent Toolkit (NAT) 的即時語音對話 Agent，相容 [小智 ESP32](https://github.com/78/xiaozhi-esp32) / [py-xiaozhi](https://github.com/zhayujie/py-xiaozhi) 客戶端協議。
 
 將原本小智 AI 的多進程雙系統架構，完整移植為 **NAT 自定義元件**——15 個 Python 模組、0 行 NAT 原始碼修改、1 份統一 YAML 配置，以 `pip install` 套件形式獨立運作。
@@ -161,10 +163,6 @@ ls /dev/video*
 ---
 
 ### 方式 A — pip install（原生安裝）
-
----
-
-### 方式 A — pip install（推薦）
 
 NAT 已發佈至 PyPI（套件名 `nvidia-nat`），不需要 clone NAT repo。
 
