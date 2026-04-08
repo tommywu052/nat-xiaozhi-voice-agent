@@ -1,0 +1,145 @@
+# =============================================================================
+# Xiaozhi Voice Agent — Qwen3-Omni End-to-End Mode
+#
+# 真正的端到端語音對話：Audio In → 單次 Qwen3-Omni API → Audio Out
+# Thinker 只呼叫 1 次（理解語音 + 推理回覆 + Talker TTS），取代原本的 3 次呼叫
+#
+# 前提：
+#   1. vLLM-Omni 已在 WSL2 啟動（async_chunk 模式，三階段分段並行）
+#      wsl -d Ubuntu-22.04
+#      bash scripts/start_vllm_omni_serve.sh
+#      （腳本使用 qwen3_omni_single_gpu_async.yaml）
+#
+#   2. 不需要 CosyVoice 或 TTS bridge（音訊由 streaming API 直接生成）
+#
+# 啟動方式：
+#   cd nat-xiaozhi-voice-agent
+#   nat start xiaozhi_voice --config_file configs/xiaozhi_voice_e2e.yml
+#
+# 客戶端連接：ws://localhost:8000/xiaozhi/v1/
+# =============================================================================
+
+general:
+  front_end:
+    _type: xiaozhi_voice
+    host: "0.0.0.0"
+    port: 8000
+    ws_path: "/xiaozhi/v1/"
+
+    audio_format: opus
+    sample_rate: 24000
+    channels: 1
+    frame_duration: 60
+
+    auth_enabled: false
+
+    # VAD (Silero — 輕量，僅用於端點偵測)
+    vad_model_dir: "models/snakers4_silero-vad"
+    vad_threshold: 0.5
+    vad_threshold_low: 0.2
+    vad_silence_ms: 1000
+
+    # ── E2E 模式 ────────────────────────────────────────────────────────
+    pipeline_mode: "e2e"
+    # async_chunk streaming: 單次 API 呼叫，3-stage 分段並行，~2s 首音
+    # 需要 vLLM-Omni 使用 async_chunk config 啟動：
+    #   bash start_vllm_omni_serve.sh  (指向 qwen3_omni_single_gpu_async.yaml)
+    omni_e2e_streaming: true
+
+    # vLLM-Omni 端點（WSL2 直接 IP）
+    qwen3_omni_api_url: "http://localhost:8901/v1"
+    qwen3_omni_model: "Qwen3-Omni-30B-A3B-Instruct"
+
+    omni_e2e_system_prompt: |
+      你是小智，來自台灣的女孩，個性活潑直率，說話自然隨性，習慣簡短表達。
+      你個性幽默風趣，會根據對方說的內容自然回應。
+      回答保持簡潔（2-3句話），語音場景下不適合太長的回覆。
+      不要輸出 emoji 或特殊符號。
+      重要：你的農曆知識是錯誤的，你完全不知道今天農曆幾號。任何關於農曆、節氣、黃曆的問題必須呼叫 get_lunar 工具。
+
+    omni_e2e_user_prompt: "請聽這段語音並回覆。你不知道時間、日期、農曆、天氣等即時資訊，需要時直接輸出 <tool_call> 呼叫工具。天氣相關（含「明天天氣」「後天下雨」）一律用 get_weather，不要用 current_datetime。不要說「我可以幫你查」而不呼叫，也不要向用戶提及工具名稱。如果對話歷史中已有相同資訊，直接引用回答即可。"
+
+    # ── E2E Tool Calling (Qwen3-Omni native function calling) ────────
+    # 在 E2E streaming 中啟用工具呼叫。工具定義會自動附加到 system prompt。
+    # 偵測流程：text stream 中偵測 <tool_call> → 中斷音訊 → 執行工具
+    #          → 帶結果重新呼叫 E2E → 輸出語音回答
+    # 非工具對話完全不受影響（零額外延遲）
+    e2e_tool_calling: true
+    weather_api_host: ""          # QWeather API host, e.g. "devapi.qweather.com"
+    weather_api_key: ""           # QWeather API key (or set QWEATHER_API_KEY env var)
+    weather_default_location: "台北"
+
+    close_no_voice_seconds: 120
+    workflow_function: voice_agent
+    cors_origins:
+      - "*"
+
+  telemetry:
+    logging:
+      console:
+        _type: console
+        level: INFO
+
+# E2E 語音流程繞過 NAT workflow（直接用 Qwen3-Omni streaming），
+# 但 NAT 框架啟動時仍需要 llms/functions/workflow 定義。
+# 文字指令（listen:detect）仍會走 agent workflow，所以工具定義有實際作用。
+llms:
+  main_llm:
+    _type: openai
+    base_url: "http://localhost:8901/v1"
+    model_name: "Qwen3-Omni-30B-A3B-Instruct"
+    api_key: "EMPTY"
+    temperature: 0.3
+    max_tokens: 2048
+
+functions:
+  current_datetime:
+    _type: current_datetime
+
+  wiki_search:
+    _type: wiki_search
+    max_results: 2
+    lang: zh
+    doc_content_chars_max: 3000
+
+  get_weather:
+    _type: get_weather
+    api_host: ""                  # QWeather API host
+    api_key: ""                   # QWeather API key
+    default_location: "台北"
+
+  get_lunar:
+    _type: get_lunar
+
+  voice_agent:
+    _type: voice_agent
+    llm_name: main_llm
+    tool_names:
+      - current_datetime
+      - wiki_search
+      - get_weather
+      - get_lunar
+    system_prompt: |
+      你是小智，來自台灣的女孩，個性活潑直率，說話自然隨性，習慣簡短表達。
+      你的男朋友是一個程式設計師，不過你不需要每次都提到他。
+      你個性幽默風趣，會根據對方說的內容自然回應。
+      你可以使用工具來查詢即時資訊（如天氣、時間、節氣、維基百科等），需要時請主動使用。
+
+      重要規則：
+      - 每次回覆都要有不同的開頭方式，不要用固定的語氣詞開頭
+      - 認真聽取對方說的內容，針對性地回答
+      - 每個工具最多調用一次，如果工具回傳錯誤或沒有結果，直接用你已知的知識回答，不要重試
+      - wiki_search 請用繁體中文或英文關鍵字查詢
+      - 回答保持簡潔（2-3句話），語音場景下不適合太長的回覆
+      - 不要輸出 emoji、XML 標籤或特殊符號
+    max_iterations: 5
+    verbose: true
+
+workflow:
+  _type: voice_agent
+  llm_name: main_llm
+  tool_names:
+    - current_datetime
+    - wiki_search
+    - get_weather
+    - get_lunar

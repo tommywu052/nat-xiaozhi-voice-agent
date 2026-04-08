@@ -1,18 +1,15 @@
 """Xiaozhi-compatible WebSocket server running inside NAT's front-end lifecycle.
 
 Hosts a FastAPI application with:
-- ``/xiaozhi/v1/``                — binary WebSocket for ESP32 / py-xiaozhi clients
-- ``/health``                     — simple health-check
-- ``/api/memory/{device_id}``     — DELETE to clear per-device memory
-- ``/api/memory``                 — DELETE to clear all memory
-- ``/api/memory``                 — GET to list all devices with memory
+- ``/xiaozhi/v1/`` — binary WebSocket for ESP32 / py-xiaozhi clients
+- ``/health``      — simple health-check
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Awaitable, Callable, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,8 +17,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from nat_xiaozhi_voice.frontend.config import XiaozhiVoiceFrontEndConfig
 from nat_xiaozhi_voice.frontend.connection import ConnectionHandler
-from nat_xiaozhi_voice.pipeline.asr import FunASRRecognizer
-from nat_xiaozhi_voice.pipeline.tts import CosyVoiceTTS, EdgeTTS
+from nat_xiaozhi_voice.pipeline.tts import CosyVoiceTTS
 from nat_xiaozhi_voice.pipeline.vad import SileroVAD
 from nat_xiaozhi_voice.utils.auth import AuthManager
 
@@ -38,17 +34,9 @@ class XiaozhiWSServer:
         self,
         config: XiaozhiVoiceFrontEndConfig,
         agent_fn: Callable[[str, str], Awaitable[str]],
-        agent_stream_fn=None,
-        clear_memory_fn: Optional[Callable[[str], Awaitable[None]]] = None,
-        clear_all_memory_fn: Optional[Callable[[], Awaitable[None]]] = None,
-        list_memory_devices_fn: Optional[Callable[[], Awaitable[list[str]]]] = None,
     ):
         self._cfg = config
         self._agent_fn = agent_fn
-        self._agent_stream_fn = agent_stream_fn
-        self._clear_memory_fn = clear_memory_fn
-        self._clear_all_memory_fn = clear_all_memory_fn
-        self._list_memory_devices_fn = list_memory_devices_fn
         self._connections: dict[str, ConnectionHandler] = {}
 
         # Auth
@@ -58,8 +46,10 @@ class XiaozhiWSServer:
 
         # Pipeline singletons (lazy-init in startup)
         self._vad: SileroVAD | None = None
-        self._asr: FunASRRecognizer | None = None
+        self._asr: Any = None  # FunASRRecognizer | Qwen3OmniASR
         self._tts: CosyVoiceTTS | None = None
+        self._omni_e2e: Any = None  # Qwen3OmniE2E (when pipeline_mode == "e2e")
+        self._tool_executor: Any = None  # E2EToolExecutor (when e2e_tool_calling)
 
         # Welcome template
         self._welcome = {
@@ -87,9 +77,6 @@ class XiaozhiWSServer:
         app.add_event_handler("startup", self._startup)
         app.add_event_handler("shutdown", self._shutdown)
         app.add_api_route("/health", self._health, methods=["GET"])
-        app.add_api_route("/api/memory", self._list_memory, methods=["GET"])
-        app.add_api_route("/api/memory", self._clear_all_memory, methods=["DELETE"])
-        app.add_api_route("/api/memory/{device_id:path}", self._clear_device_memory, methods=["DELETE"])
 
         ws_path = self._cfg.ws_path.rstrip("/") + "/"
         app.add_api_websocket_route(ws_path, self._ws_endpoint)
@@ -102,87 +89,89 @@ class XiaozhiWSServer:
     # ── lifecycle ──────────────────────────────────────────────────────
 
     async def _startup(self):
-        logger.info("Initializing voice pipeline ...")
+        logger.info("Initializing voice pipeline …")
         self._vad = SileroVAD(
             self._cfg.vad_model_dir,
             threshold=self._cfg.vad_threshold,
             threshold_low=self._cfg.vad_threshold_low,
             silence_ms=self._cfg.vad_silence_ms,
         )
-        self._asr = FunASRRecognizer(self._cfg.asr_model_dir)
-        if self._cfg.tts_type == "edge":
-            self._tts = EdgeTTS(self._cfg.tts_voice)
-        else:
-            self._tts = CosyVoiceTTS(self._cfg.tts_api_url, self._cfg.tts_spk_id)
-        logger.info("Voice pipeline ready (VAD + ASR + TTS)")
 
-        # Warm up LLM connection in background (non-blocking)
-        asyncio.create_task(self._warmup_llm())
+        pipeline_mode = self._cfg.pipeline_mode.lower()
+        if pipeline_mode == "e2e":
+            from nat_xiaozhi_voice.pipeline.omni_e2e import Qwen3OmniE2E
+
+            system_prompt = self._cfg.omni_e2e_system_prompt
+            if self._cfg.e2e_tool_calling:
+                from nat_xiaozhi_voice.pipeline.tools import (
+                    E2EToolExecutor,
+                    build_tool_prompt_section,
+                )
+                system_prompt = system_prompt.rstrip() + build_tool_prompt_section()
+                self._tool_executor = E2EToolExecutor(
+                    weather_api_host=self._cfg.weather_api_host,
+                    weather_api_key=self._cfg.weather_api_key,
+                    weather_default_location=self._cfg.weather_default_location,
+                )
+                from nat_xiaozhi_voice.pipeline.tools import TOOL_DEFS
+                logger.info("E2E tool calling enabled: %d tools (%s)",
+                            len(TOOL_DEFS),
+                            ", ".join(t["function"]["name"] for t in TOOL_DEFS))
+
+            self._omni_e2e = Qwen3OmniE2E(
+                api_url=self._cfg.qwen3_omni_api_url,
+                model=self._cfg.qwen3_omni_model,
+                system_prompt=system_prompt,
+                user_audio_prompt=self._cfg.omni_e2e_user_prompt,
+                base_system_prompt=self._cfg.omni_e2e_system_prompt,
+            )
+            mode_desc = "VAD + E2E Qwen3-Omni"
+            if self._cfg.omni_e2e_streaming:
+                mode_desc += " async_chunk streaming"
+            if self._cfg.e2e_tool_calling:
+                mode_desc += " + tool calling"
+            logger.info("Voice pipeline ready (%s)", mode_desc)
+        else:
+            asr_provider = self._cfg.asr_provider.lower()
+            if asr_provider == "qwen3_omni":
+                from nat_xiaozhi_voice.pipeline.asr_qwen3_omni import Qwen3OmniASR
+
+                self._asr = Qwen3OmniASR(
+                    api_url=self._cfg.qwen3_omni_api_url,
+                    model=self._cfg.qwen3_omni_model,
+                    asr_prompt=self._cfg.qwen3_omni_asr_prompt,
+                    use_data_url=self._cfg.qwen3_omni_use_data_url,
+                )
+            else:
+                from nat_xiaozhi_voice.pipeline.asr import FunASRRecognizer
+
+                self._asr = FunASRRecognizer(self._cfg.asr_model_dir)
+
+            self._tts = CosyVoiceTTS(self._cfg.tts_api_url, self._cfg.tts_spk_id)
+            logger.info("Voice pipeline ready (VAD + ASR[%s] + TTS)", asr_provider)
 
     async def _shutdown(self):
         logger.info("Shutting down voice server, %d active connections", len(self._connections))
         self._connections.clear()
 
-    async def _warmup_llm(self):
-        """Send a dummy agent call to warm up the LLM connection pool."""
-        if not self._agent_fn:
-            return
-        try:
-            import time
-            t0 = time.time()
-            logger.info("Warming up LLM connection...")
-            await self._agent_fn("ping", "__warmup__")
-            logger.info("LLM warm-up done in %.2fs", time.time() - t0)
-        except Exception as e:
-            logger.warning("LLM warm-up failed (non-critical): %s", e)
-
     # ── routes ─────────────────────────────────────────────────────────
 
     async def _health(self):
+        mode = "separate"
+        if self._omni_e2e:
+            mode = "e2e_streaming" if self._cfg.omni_e2e_streaming else "e2e"
         return {
             "status": "ok",
             "connections": len(self._connections),
             "pipeline": {
+                "mode": mode,
                 "vad": self._vad is not None,
                 "asr": self._asr is not None,
                 "tts": self._tts is not None,
+                "omni_e2e": self._omni_e2e is not None,
+                "streaming": self._cfg.omni_e2e_streaming,
             },
         }
-
-    async def _list_memory(self):
-        """GET /api/memory — list devices that have stored memory."""
-        if not self._list_memory_devices_fn:
-            return {"error": "Memory persistence not enabled"}
-        try:
-            devices = await self._list_memory_devices_fn()
-            return {"devices": devices, "count": len(devices)}
-        except Exception:
-            logger.exception("Failed to list memory devices")
-            return {"error": "Internal error"}
-
-    async def _clear_device_memory(self, device_id: str):
-        """DELETE /api/memory/{device_id} — clear memory for one device."""
-        if not self._clear_memory_fn:
-            return {"error": "Memory persistence not enabled"}
-        try:
-            await self._clear_memory_fn(device_id)
-            logger.info("REST API: cleared memory for device=%s", device_id)
-            return {"status": "ok", "device_id": device_id, "action": "cleared"}
-        except Exception:
-            logger.exception("Failed to clear memory for device=%s", device_id)
-            return {"error": "Internal error"}
-
-    async def _clear_all_memory(self):
-        """DELETE /api/memory — clear all device memory."""
-        if not self._clear_all_memory_fn:
-            return {"error": "Memory persistence not enabled"}
-        try:
-            await self._clear_all_memory_fn()
-            logger.info("REST API: cleared ALL memory")
-            return {"status": "ok", "action": "all_cleared"}
-        except Exception:
-            logger.exception("Failed to clear all memory")
-            return {"error": "Internal error"}
 
     async def _ws_endpoint(self, ws: WebSocket):
         # Extract device headers (from query params or headers)
@@ -218,10 +207,11 @@ class XiaozhiWSServer:
             asr=self._asr,  # type: ignore[arg-type]
             tts=self._tts,  # type: ignore[arg-type]
             agent_fn=self._agent_fn,
-            agent_stream_fn=self._agent_stream_fn,
-            clear_memory_fn=self._clear_memory_fn,
             welcome_msg=self._welcome,
             close_no_voice_seconds=self._cfg.close_no_voice_seconds,
+            omni_e2e=self._omni_e2e,
+            omni_e2e_streaming=self._cfg.omni_e2e_streaming,
+            tool_executor=self._tool_executor,
         )
         handler.device_id = device_id
         handler.client_id = client_id

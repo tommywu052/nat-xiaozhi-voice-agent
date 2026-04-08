@@ -1,57 +1,28 @@
-"""Per-connection state and message handling for a single xiaozhi client.
-
-Ported from xiaozhi-esp32-server's ``core/connection.py`` and
-``core/providers/tts/base.py``, adapted for NAT's async architecture:
-
-* **Streaming LLM** — tokens arrive via ``astream_events`` and are buffered.
-* **Sentence splitting** — the buffer is flushed at punctuation boundaries.
-  The *first* segment uses aggressive punctuation (including ``，``) so the
-  user hears audio within ~2-3 s; subsequent segments split at sentence-ending
-  punctuation only.
-* **Chunked TTS** — each segment is synthesized independently and pushed to
-  the audio rate-controller while the LLM continues streaming.
-* **Per-device memory** — ``device_id`` is used as the LangGraph ``thread_id``
-  so the same physical device resumes its conversation across reconnects.
-  Memory is persisted to SQLite via ``AsyncSqliteSaver``.
-* **Voice memory commands** — user can say "清除記憶" / "忘記我" / "重新開始"
-  to wipe the device's conversation history.
-"""
+"""Per-connection state and message handling for a single xiaozhi client."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
+import numpy as np
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
-from nat_xiaozhi_voice.pipeline.asr import FunASRRecognizer
-from nat_xiaozhi_voice.pipeline.tts import CosyVoiceTTS, _clean_for_tts
+from nat_xiaozhi_voice.pipeline.tts import CosyVoiceTTS
 from nat_xiaozhi_voice.pipeline.vad import SileroVAD
-from nat_xiaozhi_voice.utils.audio_codec import decode_opus_packet, create_opus_decoder, DECODE_FRAME_SAMPLES
+from nat_xiaozhi_voice.utils.audio_codec import OpusEncoder, decode_opus_packet, create_opus_decoder, DECODE_FRAME_SAMPLES
 from nat_xiaozhi_voice.utils.audio_rate_controller import AudioRateController, PRE_BUFFER_COUNT
 
 if TYPE_CHECKING:
-    pass
+    from nat_xiaozhi_voice.pipeline.omni_e2e import Qwen3OmniE2E
+    from nat_xiaozhi_voice.pipeline.tools import E2EToolExecutor
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Sentence-splitting constants (ported from xiaozhi-esp32-server tts/base.py)
-# ---------------------------------------------------------------------------
-FIRST_SENTENCE_PUNCTS = frozenset("，,、。！？；：!?;:\n")
-NORMAL_SENTENCE_PUNCTS = frozenset("。！？!?\n")
-MAX_BUFFER_CHARS = 150
-FIRST_SENTENCE_MIN_CHARS = 2
-
-CLEAR_MEMORY_KEYWORDS = frozenset({
-    "清除記憶", "清除记忆", "忘記我", "忘记我",
-    "重新開始", "重新开始", "清空對話", "清空对话",
-    "刪除記憶", "删除记忆",
-})
 
 
 class ConnectionHandler:
@@ -62,21 +33,23 @@ class ConnectionHandler:
         ws: WebSocket,
         *,
         vad: SileroVAD,
-        asr: FunASRRecognizer,
+        asr: Any,
         tts: CosyVoiceTTS,
         agent_fn: Callable[[str, str], Awaitable[str]],
-        agent_stream_fn: Optional[Callable[[str, str], AsyncIterator[str]]] = None,
-        clear_memory_fn: Optional[Callable[[str], Awaitable[None]]] = None,
         welcome_msg: dict[str, Any],
         close_no_voice_seconds: int = 120,
+        omni_e2e: Optional["Qwen3OmniE2E"] = None,
+        omni_e2e_streaming: bool = False,
+        tool_executor: Optional["E2EToolExecutor"] = None,
     ):
         self.ws = ws
         self._vad = vad
         self._asr = asr
         self._tts = tts
         self._agent_fn = agent_fn
-        self._agent_stream_fn = agent_stream_fn
-        self._clear_memory_fn = clear_memory_fn
+        self._omni_e2e = omni_e2e
+        self._omni_e2e_streaming = omni_e2e_streaming
+        self._tool_executor = tool_executor
         self._welcome_msg = dict(welcome_msg)
         self._close_no_voice_s = close_no_voice_seconds
 
@@ -100,12 +73,17 @@ class ConnectionHandler:
         # State flags
         self._tts_playing = False
         self._closed = False
-        self._abort_requested = False
+        self._processing_task: asyncio.Task | None = None
 
     # ── lifecycle ──────────────────────────────────────────────────────
 
     async def run(self):
-        """Main loop — read messages until disconnect."""
+        """Main loop — read messages until disconnect.
+
+        Long-running operations (_process_voice, _run_agent_and_speak) are
+        spawned as background tasks so that the receive loop stays responsive
+        to WebSocket control frames (ping/pong) and abort messages.
+        """
         self._rate_task = self._rate_ctrl.start(self._send_audio_frame)
         try:
             while not self._closed:
@@ -122,6 +100,8 @@ class ConnectionHandler:
         except Exception:
             logger.exception("Connection %s error", self.device_id)
         finally:
+            if self._processing_task and not self._processing_task.done():
+                self._processing_task.cancel()
             await self._cleanup()
 
     async def _cleanup(self):
@@ -129,55 +109,9 @@ class ConnectionHandler:
         self._rate_ctrl.stop()
         if self._rate_task and not self._rate_task.done():
             self._rate_task.cancel()
+        if self._omni_e2e:
+            self._omni_e2e.clear_history(self.session_id)  # type: ignore[union-attr]
         logger.info("Connection closed: device=%s session=%s", self.device_id, self.session_id)
-
-    # ── per-device memory ─────────────────────────────────────────────
-
-    @property
-    def memory_thread_id(self) -> str:
-        """LangGraph thread_id: use device_id for per-device persistence."""
-        if self.device_id and self.device_id != "unknown":
-            return self.device_id
-        return self.session_id
-
-    async def _handle_clear_memory(self):
-        """Wipe the device's conversation history and confirm via TTS."""
-        tid = self.memory_thread_id
-        if self._clear_memory_fn:
-            try:
-                await self._clear_memory_fn(tid)
-                logger.info("Memory cleared for thread=%s (device=%s)", tid, self.device_id)
-            except Exception:
-                logger.exception("Failed to clear memory for thread=%s", tid)
-
-        confirm = "好的，我已經忘記之前的對話了，我們重新開始吧！"
-        await self._send_json({"type": "tts", "state": "start", "session_id": self.session_id})
-        self._tts_playing = True
-        self._rate_ctrl.reset()
-        self._rate_task = self._rate_ctrl.start(self._send_audio_frame)
-
-        frame_count = 0
-
-        def _on_frame(opus_bytes: bytes):
-            nonlocal frame_count
-            frame_count += 1
-            self._rate_ctrl.add_audio(opus_bytes)
-
-        try:
-            await self._tts.synthesize_stream(confirm, 24000, _on_frame)
-        except Exception:
-            logger.exception("TTS error during memory-clear confirmation")
-
-        async def _send_stop():
-            await self._send_json({"type": "tts", "state": "stop", "session_id": self.session_id})
-            self._tts_playing = False
-
-        self._rate_ctrl.add_message(_send_stop)
-
-        async def _send_listen():
-            await self._send_json({"type": "listen", "state": "start", "session_id": self.session_id})
-
-        self._rate_ctrl.add_message(_send_listen)
 
     # ── text messages ─────────────────────────────────────────────────
 
@@ -219,15 +153,29 @@ class ConnectionHandler:
             self._collecting = True
         elif state == "stop":
             self._collecting = False
-            await self._process_voice()
+            self._spawn_processing(self._process_voice())
         elif state == "detect":
             text = msg.get("text", "")
             if text:
-                await self._run_agent_and_speak(text)
+                self._spawn_processing(self._run_agent_and_speak(text))
+
+    def _spawn_processing(self, coro):
+        """Run a long-running coroutine as a background task so the
+        WebSocket receive loop stays responsive to pings and abort."""
+        if self._processing_task and not self._processing_task.done():
+            self._processing_task.cancel()
+        self._processing_task = asyncio.create_task(self._safe_run(coro))
+
+    async def _safe_run(self, coro):
+        try:
+            await coro
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Processing task error")
 
     async def _handle_abort(self):
         self._collecting = False
-        self._abort_requested = True
         self._rate_ctrl.reset()
         self._tts_playing = False
         await self._send_json({"type": "tts", "state": "stop", "session_id": self.session_id})
@@ -244,7 +192,7 @@ class ConnectionHandler:
         if self._vad_ctx.get("voice_stop"):
             self._collecting = False
             self._vad_ctx["voice_stop"] = False
-            await self._process_voice()
+            self._spawn_processing(self._process_voice())
 
     # ── voice processing pipeline ─────────────────────────────────────
 
@@ -259,189 +207,497 @@ class ConnectionHandler:
         packets = list(self._opus_packets)
         self._opus_packets.clear()
 
+        if self._omni_e2e:
+            if self._omni_e2e_streaming:
+                await self._process_voice_e2e_streaming(packets)
+            else:
+                await self._process_voice_e2e(packets)
+            return
+
         pcm = self._asr.decode_opus_to_pcm(packets)
         text = await self._asr.recognize(pcm)
-        if not text:
+
+        cleaned = re.sub(r"[。．.，,、\s]+", "", text) if text else ""
+        if not cleaned:
+            logger.info("ASR result is empty/punctuation-only, skipping agent call")
             await self._send_json({"type": "listen", "state": "start", "session_id": self.session_id})
             return
 
         await self._send_json({"type": "stt", "text": text, "session_id": self.session_id})
         await self._run_agent_and_speak(text)
 
-    # ── sentence splitting (ported from xiaozhi-esp32-server) ─────────
+    async def _process_voice_e2e(self, packets: list[bytes]):
+        """End-to-end: Audio → Qwen3-Omni (single call) → Text + Audio → Client."""
+        from nat_xiaozhi_voice.pipeline.omni_e2e import resample_pcm
 
-    @staticmethod
-    def _find_sentence_boundary(text: str, is_first: bool) -> int:
-        """Return the index of the first sentence-splitting punctuation, or -1."""
-        puncts = FIRST_SENTENCE_PUNCTS if is_first else NORMAL_SENTENCE_PUNCTS
-        for i, ch in enumerate(text):
-            if ch in puncts:
-                return i
-        return -1
+        pcm_in = self._omni_e2e.decode_opus_to_pcm(packets)  # type: ignore[union-attr]
+        user_text, text_reply, pcm_out, src_sr = await self._omni_e2e.process_audio(pcm_in)  # type: ignore[union-attr]
 
-    # ── streaming agent + chunked TTS (core pipeline) ─────────────────
-
-    async def _run_agent_and_speak(self, user_text: str):
-        """Stream LLM tokens → split into sentences → synthesize TTS per-segment.
-
-        The producer task reads LLM tokens and pushes text segments onto an
-        ``asyncio.Queue``.  The consumer task reads segments, calls TTS for
-        each one, and pushes Opus frames to the rate-controller.  Because both
-        are asyncio tasks, TTS synthesis for segment N happens concurrently
-        with LLM token streaming for segment N+1.
-        """
-        self._abort_requested = False
-
-        # Voice command: clear memory
-        stripped = user_text.strip().rstrip("。！？!?.，,")
-        if stripped in CLEAR_MEMORY_KEYWORDS:
-            await self._handle_clear_memory()
+        if not text_reply and not pcm_out:
+            await self._send_json({"type": "listen", "state": "start", "session_id": self.session_id})
             return
 
-        if self._agent_stream_fn is None:
-            await self._run_agent_and_speak_legacy(user_text)
+        if user_text:
+            await self._send_json({"type": "stt", "text": user_text, "session_id": self.session_id})
+
+        if not pcm_out:
+            await self._send_json({"type": "listen", "state": "start", "session_id": self.session_id})
             return
 
-        # -- set up TTS output ------------------------------------------------
+        if src_sr and src_sr != self.sample_rate:
+            pcm_array = np.frombuffer(pcm_out, dtype=np.int16)
+            pcm_array = resample_pcm(pcm_array, src_sr, self.sample_rate)
+            pcm_out = pcm_array.tobytes()
+
         await self._send_json({"type": "tts", "state": "start", "session_id": self.session_id})
         self._tts_playing = True
         self._rate_ctrl.reset()
         self._rate_task = self._rate_ctrl.start(self._send_audio_frame)
 
+        encoder = OpusEncoder(self.sample_rate, channels=1, frame_size_ms=60)
         frame_count = 0
-        full_reply_parts: list[str] = []
-        segment_queue: asyncio.Queue[str | None] = asyncio.Queue()
-        t_start = time.time()
 
         def _on_opus_frame(opus_bytes: bytes):
             nonlocal frame_count
             frame_count += 1
             self._rate_ctrl.add_audio(opus_bytes)
 
-        # -- producer: LLM stream → sentence segments --------------------------
-        async def _llm_producer():
-            text_buf: list[str] = []
-            is_first_sentence = True
-            t_first_token = None
+        encoder.encode_pcm_stream(pcm_out, True, _on_opus_frame)
+        encoder.close()
+        logger.info("E2E TTS encoded %d opus frames", frame_count)
 
-            try:
-                async for chunk in self._agent_stream_fn(user_text, self.memory_thread_id):
-                    if self._abort_requested:
-                        break
-                    if t_first_token is None:
-                        t_first_token = time.time()
-                        logger.info(
-                            "LLM first token in %.2fs",
-                            t_first_token - t_start,
-                        )
-                    full_reply_parts.append(chunk)
-                    text_buf.append(chunk)
+        async def _send_stop():
+            await self._send_json({"type": "tts", "state": "stop", "session_id": self.session_id})
+            self._tts_playing = False
 
-                    buffered = "".join(text_buf)
+        self._rate_ctrl.add_message(_send_stop)
 
-                    if is_first_sentence and len(buffered) >= FIRST_SENTENCE_MIN_CHARS:
-                        boundary = self._find_sentence_boundary(buffered, True)
-                    else:
-                        boundary = self._find_sentence_boundary(buffered, is_first_sentence)
+        async def _send_listen_start():
+            await self._send_json({"type": "listen", "state": "start", "session_id": self.session_id})
 
-                    if boundary != -1:
-                        segment = buffered[: boundary + 1]
-                        remaining = buffered[boundary + 1 :]
-                        text_buf = [remaining] if remaining else []
-                        is_first_sentence = False
-                        cleaned = _clean_for_tts(segment)
-                        if cleaned:
-                            await segment_queue.put(cleaned)
-                    elif len(buffered) > MAX_BUFFER_CHARS:
-                        text_buf = []
-                        is_first_sentence = False
-                        cleaned = _clean_for_tts(buffered)
-                        if cleaned:
-                            await segment_queue.put(cleaned)
+        self._rate_ctrl.add_message(_send_listen_start)
 
-                # flush remaining text
-                remaining = "".join(text_buf).strip()
-                if remaining and not self._abort_requested:
-                    cleaned = _clean_for_tts(remaining)
-                    if cleaned:
-                        await segment_queue.put(cleaned)
-            except Exception:
-                logger.exception("LLM streaming error")
-                if not full_reply_parts:
-                    try:
-                        fallback = await self._agent_fn(user_text, self.memory_thread_id)
-                        if fallback:
-                            full_reply_parts.append(fallback)
-                            cleaned = _clean_for_tts(fallback)
-                            if cleaned:
-                                await segment_queue.put(cleaned)
-                    except Exception:
-                        logger.exception("Fallback agent call also failed")
-            finally:
-                await segment_queue.put(None)
+    async def _process_voice_e2e_streaming(self, packets: list[bytes]):
+        """Streaming E2E with async_chunk and hybrid tool-call support.
 
-        # -- consumer: sentence segments → TTS → Opus -------------------------
-        async def _tts_consumer():
-            tts_sr = 24000
-            seg_idx = 0
-            while True:
-                segment = await segment_queue.get()
-                if segment is None or self._abort_requested:
-                    break
-                seg_idx += 1
-                t0 = time.time()
-                try:
-                    await self._tts.synthesize_stream(segment, tts_sr, _on_opus_frame)
-                except Exception:
-                    logger.exception("TTS error for segment #%d (%d chars)", seg_idx, len(segment))
-                logger.debug(
-                    "TTS segment #%d done in %.2fs (%d chars)",
-                    seg_idx, time.time() - t0, len(segment),
-                )
+        Uses ``modalities=["text", "audio"]`` with ``stream=True`` so the
+        Thinker/Talker/Code2Wav stages run in an async pipeline.  Audio chunks
+        arrive as soon as Code2Wav produces them (~2 s TTFA).
 
-        # -- run producer and consumer concurrently ----------------------------
+        Tool-call detection:
+          Text tokens stream ~1.3 s before audio.  If the model emits a
+          ``<tool_call>`` tag, we abort the first stream, execute the tool,
+          and make a second E2E call with the tool result (text-only input).
+          Non-tool conversations are completely unaffected.
+        """
+        from nat_xiaozhi_voice.pipeline.omni_e2e import resample_pcm, _wav_to_pcm
+
+        t0 = time.time()
+        pcm_in = self._omni_e2e.decode_opus_to_pcm(packets)  # type: ignore[union-attr]
+        if len(pcm_in) < 3200:
+            await self._send_json({"type": "listen", "state": "start", "session_id": self.session_id})
+            return
+
+        audio_url = await self._omni_e2e.prepare_audio_url(pcm_in)  # type: ignore[union-attr]
+        # ASR deferred: starts at first audio chunk or tool-call detection
+        # so it doesn't steal GPU cycles from the critical E2E pipeline.
+        asr_task: asyncio.Task | None = None
+
+        messages = self._omni_e2e.build_audio_messages(audio_url, self.session_id)  # type: ignore[union-attr]
+
+        tts_started = False
+        text_reply = ""
+        frame_count = 0
+        audio_chunk_count = 0
+        detected_sr = 0
+        encoder: OpusEncoder | None = None
+        text_ttft: float | None = None
+        audio_ttft: float | None = None
+
+        # Tool-call detection state
+        maybe_tool_call = False
+        maybe_tool_call_time: float | None = None
+        tool_call_info: dict | None = None
+        tool_call_confirmed_time: float | None = None
+        post_tool_text = ""
+        post_tool_audio_chunks = 0
+
+        TOOL_CALL_TIMEOUT = 5.0
+        ANEXT_TIMEOUT = 60.0
+
+        def _on_opus_frame(opus_bytes: bytes):
+            nonlocal frame_count
+            frame_count += 1
+            self._rate_ctrl.add_audio(opus_bytes)
+
+        e2e_gen = self._omni_e2e.stream_e2e(messages=messages).__aiter__()  # type: ignore[union-attr]
+
         try:
-            producer = asyncio.create_task(_llm_producer())
-            consumer = asyncio.create_task(_tts_consumer())
-            await producer
-            await consumer
+            while True:
+                if (
+                    maybe_tool_call
+                    and not tool_call_info
+                    and maybe_tool_call_time
+                    and (time.time() - maybe_tool_call_time) > TOOL_CALL_TIMEOUT
+                ):
+                    logger.warning(
+                        "Tool call tag not closed within %.0fs, abandoning",
+                        TOOL_CALL_TIMEOUT,
+                    )
+                    maybe_tool_call = False
+                    maybe_tool_call_time = None
+                    if asr_task is None:
+                        asr_task = asyncio.create_task(self._omni_e2e.transcribe(audio_url))  # type: ignore[union-attr]
+                    break
+
+                try:
+                    modality, data = await asyncio.wait_for(
+                        anext(e2e_gen), timeout=ANEXT_TIMEOUT,
+                    )
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    logger.warning("E2E stream chunk timeout (%.0fs), aborting", ANEXT_TIMEOUT)
+                    if asr_task is None:
+                        asr_task = asyncio.create_task(self._omni_e2e.transcribe(audio_url))  # type: ignore[union-attr]
+                    break
+
+                if modality == "text":
+                    if text_ttft is None:
+                        text_ttft = time.time() - t0
+                    text_reply += data  # type: ignore[operator]
+
+                    if tool_call_info:
+                        post_tool_text += data  # type: ignore[operator]
+                        continue
+
+                    if self._tool_executor and not tts_started:
+                        if not maybe_tool_call and "<tool_call>" in text_reply:
+                            maybe_tool_call = True
+                            maybe_tool_call_time = time.time()
+                            if asr_task is None:
+                                asr_task = asyncio.create_task(self._omni_e2e.transcribe(audio_url))  # type: ignore[union-attr]
+                            logger.info("Possible tool call detected in E2E text stream")
+                        if maybe_tool_call and "</tool_call>" in text_reply:
+                            from nat_xiaozhi_voice.pipeline.tools import parse_tool_call
+                            tool_call_info = parse_tool_call(text_reply)
+                            if tool_call_info:
+                                tool_call_confirmed_time = time.time()
+                                logger.info(
+                                    "Tool call confirmed at %.2fs: %s — NOT breaking, observing stream...",
+                                    tool_call_confirmed_time - t0, tool_call_info,
+                                )
+                                if asr_task is None:
+                                    asr_task = asyncio.create_task(self._omni_e2e.transcribe(audio_url))  # type: ignore[union-attr]
+                            else:
+                                maybe_tool_call = False
+                                maybe_tool_call_time = None
+                    continue
+
+                if modality != "audio" or not data:
+                    continue
+
+                if tool_call_info:
+                    post_tool_audio_chunks += 1
+                    if post_tool_audio_chunks <= 3:
+                        logger.info(
+                            "Post-tool audio chunk #%d at %.2fs (size=%d bytes)",
+                            post_tool_audio_chunks, time.time() - t0, len(data),
+                        )
+                    continue
+
+                if maybe_tool_call:
+                    continue
+
+                if audio_ttft is None:
+                    audio_ttft = time.time() - t0
+                    if asr_task is None:
+                        asr_task = asyncio.create_task(self._omni_e2e.transcribe(audio_url))  # type: ignore[union-attr]
+
+                audio_chunk_count += 1
+
+                raw: bytes = data  # type: ignore[assignment]
+                chunk_sr = 0
+                if raw[:4] == b"RIFF":
+                    try:
+                        raw, chunk_sr = _wav_to_pcm(raw)
+                    except ValueError:
+                        pass
+                if chunk_sr:
+                    detected_sr = chunk_sr
+                elif detected_sr:
+                    chunk_sr = detected_sr
+                else:
+                    chunk_sr = 24000
+
+                if not tts_started:
+                    await self._send_json({"type": "tts", "state": "start", "session_id": self.session_id})
+                    self._tts_playing = True
+                    self._rate_ctrl.reset()
+                    self._rate_task = self._rate_ctrl.start(self._send_audio_frame)
+                    encoder = OpusEncoder(self.sample_rate, channels=1, frame_size_ms=60)
+                    tts_started = True
+
+                if chunk_sr != self.sample_rate:
+                    pcm_array = np.frombuffer(raw, dtype=np.int16)
+                    if len(pcm_array) > 0:
+                        pcm_array = resample_pcm(pcm_array, chunk_sr, self.sample_rate)
+                        raw = pcm_array.tobytes()
+
+                if encoder and raw:
+                    encoder.encode_pcm_stream(raw, False, _on_opus_frame)
+
+            if encoder:
+                encoder.encode_pcm_stream(b"", True, _on_opus_frame)
+                encoder.close()
+
         except Exception:
-            logger.exception("Streaming pipeline error")
+            logger.exception("E2E streaming error")
 
-        reply = "".join(full_reply_parts)
-        elapsed = time.time() - t_start
-        logger.info(
-            "Agent reply (%d chars, %.2fs total): %s",
-            len(reply), elapsed, reply[:120],
-        )
-        logger.info("TTS produced %d opus frames", frame_count)
+        # ── Observation log for tool-call experiment ───────────────────
+        if tool_call_info and tool_call_confirmed_time:
+            stream_end = time.time()
+            logger.info(
+                "=== TOOL STREAM OBSERVATION ===\n"
+                "  tool detected at: %.2fs\n"
+                "  stream ended at:  %.2fs\n"
+                "  post-tool duration: %.2fs\n"
+                "  post-tool text chunks: '%s'\n"
+                "  post-tool audio chunks: %d\n"
+                "  full text_reply: '%s'\n"
+                "  ================================",
+                tool_call_confirmed_time - t0,
+                stream_end - t0,
+                stream_end - tool_call_confirmed_time,
+                post_tool_text[:200],
+                post_tool_audio_chunks,
+                text_reply[:300],
+            )
 
-        # -- signal playback done ----------------------------------------------
-        if not self._abort_requested:
+        # ── Recover incomplete tool call (missing </tool_call>) ─────
+        if not tool_call_info and "<tool_call>" in text_reply:
+            from nat_xiaozhi_voice.pipeline.tools import parse_tool_call_lenient
+            tool_call_info = parse_tool_call_lenient(text_reply)
+            if tool_call_info:
+                logger.info("Tool call recovered from incomplete tag: %s", tool_call_info)
+
+        # ── Handle tool call ──────────────────────────────────────────
+        if tool_call_info:
+            t_tool_start = time.time()
+            tool_detect_dur = t_tool_start - t0
+
+            if asr_task is None:
+                asr_task = asyncio.create_task(self._omni_e2e.transcribe(audio_url))  # type: ignore[union-attr]
+
+            logger.info(
+                "Executing tool %s(%s)",
+                tool_call_info["name"], tool_call_info["arguments"],
+            )
+            tool_result = await self._tool_executor.execute(  # type: ignore[union-attr]
+                tool_call_info["name"], tool_call_info["arguments"],
+            )
+            t_tool_done = time.time()
+            logger.info(
+                "Tool result (%.0f chars, exec=%.2fs): %s",
+                len(tool_result), t_tool_done - t_tool_start, tool_result[:200],
+            )
+
+            user_text = ""
+            if asr_task and asr_task.done():
+                try:
+                    user_text = asr_task.result() or ""
+                except Exception:
+                    pass
+            if user_text:
+                await self._send_json({"type": "stt", "text": user_text, "session_id": self.session_id})
+
+            logger.info(
+                "Tool timing: detect=%.2fs exec=%.2fs asr=%s → followup starts at %.2fs",
+                tool_detect_dur, t_tool_done - t_tool_start,
+                "ready" if user_text else "pending",
+                time.time() - t0,
+            )
+
+            followup_msgs = self._omni_e2e.build_tool_followup_messages(  # type: ignore[union-attr]
+                user_text or "（語音輸入）",
+                tool_call_info["name"],
+                tool_result,
+                session_id=self.session_id,
+            )
+            await self._stream_e2e_followup(
+                followup_msgs, t0, user_text or "",
+            )
+
+            if not user_text and asr_task and not asr_task.done():
+                try:
+                    user_text = await asyncio.wait_for(asr_task, timeout=10) or ""
+                    if user_text:
+                        await self._send_json({"type": "stt", "text": user_text, "session_id": self.session_id})
+                except (asyncio.TimeoutError, Exception):
+                    pass
+
+            await self._omni_e2e.cleanup_audio_url(audio_url)  # type: ignore[union-attr]
+            return
+
+        # ── Normal flow (no tool call) ────────────────────────────────
+
+        # Ensure ASR is started before cleanup (needs the WAV file)
+        if asr_task is None:
+            asr_task = asyncio.create_task(self._omni_e2e.transcribe(audio_url))  # type: ignore[union-attr]
+        user_text = await asr_task
+
+        await self._omni_e2e.cleanup_audio_url(audio_url)  # type: ignore[union-attr]
+
+        if user_text:
+            await self._send_json({"type": "stt", "text": user_text, "session_id": self.session_id})
+
+        from nat_xiaozhi_voice.pipeline.tools import strip_tool_tags
+        clean_reply = strip_tool_tags(text_reply) if text_reply else text_reply
+
+        if tts_started:
+            self._omni_e2e._append_turn(self.session_id, user_text or "", clean_reply)  # type: ignore[union-attr]
+
+            elapsed = time.time() - t0
+            logger.info(
+                "StreamE2E done: text='%s' | text_ttft=%.2fs audio_ttft=%.2fs | "
+                "%d audio chunks, %d opus frames, %.1fs total",
+                clean_reply[:60],
+                text_ttft or 0, audio_ttft or 0,
+                audio_chunk_count, frame_count, elapsed,
+            )
+
             async def _send_stop():
                 await self._send_json({"type": "tts", "state": "stop", "session_id": self.session_id})
                 self._tts_playing = False
-
             self._rate_ctrl.add_message(_send_stop)
 
-            async def _send_listen_start():
+            async def _send_listen():
                 await self._send_json({"type": "listen", "state": "start", "session_id": self.session_id})
-
-            self._rate_ctrl.add_message(_send_listen_start)
+            self._rate_ctrl.add_message(_send_listen)
         else:
-            self._tts_playing = False
+            logger.info("No audio produced, sending listen:start (text='%s')", clean_reply[:60] if clean_reply else "")
+            await self._send_json({"type": "listen", "state": "start", "session_id": self.session_id})
 
-    # ── non-streaming fallback ────────────────────────────────────────
+    async def _stream_e2e_followup(
+        self,
+        messages: list[dict],
+        t0: float,
+        user_text: str,
+    ):
+        """Stream a follow-up E2E response after tool execution.
 
-    async def _run_agent_and_speak_legacy(self, user_text: str):
-        """Non-streaming fallback: wait for full reply, then synthesize."""
+        No further tool-call detection (prevents infinite loops).
+        Uses the same async_chunk streaming as the primary E2E path.
+        """
+        from nat_xiaozhi_voice.pipeline.omni_e2e import resample_pcm, _wav_to_pcm
+
+        t_followup = time.time()
+        tts_started = False
+        text_reply = ""
+        frame_count = 0
+        audio_chunk_count = 0
+        detected_sr = 0
+        encoder: OpusEncoder | None = None
+        text_ttft: float | None = None
+        audio_ttft: float | None = None
+
+        def _on_opus_frame(opus_bytes: bytes):
+            nonlocal frame_count
+            frame_count += 1
+            self._rate_ctrl.add_audio(opus_bytes)
+
+        async for modality, data in self._omni_e2e.stream_e2e(messages=messages):  # type: ignore[union-attr]
+            if modality == "text":
+                if text_ttft is None:
+                    text_ttft = time.time() - t_followup
+                text_reply += data  # type: ignore[operator]
+                continue
+
+            if modality != "audio" or not data:
+                continue
+
+            if audio_ttft is None:
+                audio_ttft = time.time() - t_followup
+
+            audio_chunk_count += 1
+
+            raw: bytes = data  # type: ignore[assignment]
+            chunk_sr = 0
+            if raw[:4] == b"RIFF":
+                try:
+                    raw, chunk_sr = _wav_to_pcm(raw)
+                except ValueError:
+                    pass
+            if chunk_sr:
+                detected_sr = chunk_sr
+            elif detected_sr:
+                chunk_sr = detected_sr
+            else:
+                chunk_sr = 24000
+
+            if not tts_started:
+                await self._send_json({"type": "tts", "state": "start", "session_id": self.session_id})
+                self._tts_playing = True
+                self._rate_ctrl.reset()
+                self._rate_task = self._rate_ctrl.start(self._send_audio_frame)
+                encoder = OpusEncoder(self.sample_rate, channels=1, frame_size_ms=60)
+                tts_started = True
+
+            if chunk_sr != self.sample_rate:
+                pcm_array = np.frombuffer(raw, dtype=np.int16)
+                if len(pcm_array) > 0:
+                    pcm_array = resample_pcm(pcm_array, chunk_sr, self.sample_rate)
+                    raw = pcm_array.tobytes()
+
+            if encoder and raw:
+                encoder.encode_pcm_stream(raw, False, _on_opus_frame)
+
+        if encoder:
+            encoder.encode_pcm_stream(b"", True, _on_opus_frame)
+            encoder.close()
+
+        self._omni_e2e.append_tool_turn(  # type: ignore[union-attr]
+            self.session_id, user_text, text_reply,
+        )
+
+        elapsed = time.time() - t0
+        followup_dur = time.time() - t_followup
+        logger.info(
+            "Tool followup E2E done: text='%s' | "
+            "followup_text_ttft=%.2fs followup_audio_ttft=%.2fs | "
+            "%d audio chunks, %d opus frames, %.1fs followup, %.1fs total",
+            text_reply[:60],
+            text_ttft or 0, audio_ttft or 0,
+            audio_chunk_count, frame_count, followup_dur, elapsed,
+        )
+
+        if tts_started:
+            async def _send_stop():
+                await self._send_json({"type": "tts", "state": "stop", "session_id": self.session_id})
+                self._tts_playing = False
+            self._rate_ctrl.add_message(_send_stop)
+
+            async def _send_listen():
+                await self._send_json({"type": "listen", "state": "start", "session_id": self.session_id})
+            self._rate_ctrl.add_message(_send_listen)
+        else:
+            logger.warning("Tool followup produced no audio, sending text-only response")
+            await self._send_json({"type": "tts", "state": "start", "session_id": self.session_id})
+            await self._send_json({"type": "tts", "state": "stop", "session_id": self.session_id})
+            await self._send_json({"type": "listen", "state": "start", "session_id": self.session_id})
+
+    async def _run_agent_and_speak(self, user_text: str):
+        """Invoke the NAT workflow agent, then stream TTS back."""
+        import time as _time
+        logger.info("Calling agent with: %s", user_text[:100])
+        t0 = _time.time()
         try:
-            reply = await self._agent_fn(user_text, self.memory_thread_id)
+            reply = await self._agent_fn(user_text, self.session_id)
         except Exception:
             logger.exception("Agent error")
             reply = "抱歉，我遇到了一點問題。"
-
-        logger.info("Agent reply (%d chars): %s", len(reply) if reply else 0, (reply or "")[:120])
+        logger.info("Agent replied in %.1fs: %s", _time.time() - t0,
+                     (reply or "(empty)")[:120])
 
         if not reply:
             await self._send_json({"type": "listen", "state": "start", "session_id": self.session_id})
@@ -459,14 +715,14 @@ class ConnectionHandler:
             frame_count += 1
             self._rate_ctrl.add_audio(opus_bytes)
 
-        tts_sample_rate = 24000
+        logger.info("Starting TTS for %d chars …", len(reply))
         try:
             await self._tts.synthesize_stream(
-                reply, tts_sample_rate, _on_opus_frame, is_last=True,
+                reply, self.sample_rate, _on_opus_frame, is_last=True,
             )
+            logger.info("TTS done, %d opus frames generated", frame_count)
         except Exception:
             logger.exception("TTS error")
-        logger.info("TTS produced %d opus frames", frame_count)
 
         async def _send_stop():
             await self._send_json({"type": "tts", "state": "stop", "session_id": self.session_id})

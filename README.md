@@ -1,46 +1,59 @@
-# Xiaozhi Voice Agent (NAT Plugin)
-
-[English](README_en.md) | **繁體中文**
+# Xiaozhi Voice Agent — Qwen3-Omni E2E Edition (NAT Plugin)
 
 基於 NVIDIA NeMo Agent Toolkit (NAT) 的即時語音對話 Agent，相容 [小智 ESP32](https://github.com/78/xiaozhi-esp32) / [py-xiaozhi](https://github.com/zhayujie/py-xiaozhi) 客戶端協議。
 
-將原本小智 AI 的多進程雙系統架構，完整移植為 **NAT 自定義元件**——15 個 Python 模組、0 行 NAT 原始碼修改、1 份統一 YAML 配置，以 `pip install` 套件形式獨立運作。
+採用 **Qwen3-Omni 端到端語音模式**——單次 API 呼叫同時完成語音理解、文字推理、語音合成，將 Thinker 呼叫從 3 次降至 1 次，不需要外部 ASR 或 TTS 服務。
 
-### Demo
+## 核心特性
 
-[![NAT Voice Agent Demo](docs/demo-thumbnail.png)](https://youtu.be/F58cTtn1T2I)
+- **端到端語音對話** — Audio In → 單次 Qwen3-Omni API → Audio Out，無需 ASR / TTS 外部服務
+- **async_chunk Streaming** — Thinker / Talker / Code2Wav 三階段分段並行，~2s 首音延遲
+- **Native Tool Calling** — Qwen3-Omni 原生 `<tool_call>` 標籤，非工具對話零額外延遲
+- **NAT 插件架構** — 0 行 NAT 原始碼修改，`pip install` 即生效
+- **100% 客戶端相容** — ESP32 / py-xiaozhi 零修改直接遷移
 
-## 為何移植到 NAT？
+## E2E Streaming (async_chunk)
 
-### NAT 四大擴展點運用
+vLLM-Omni 的 `async_chunk` 模式讓三個階段分段並行：
+
+```
+User Audio ──► [Thinker: 理解 + 推理] ──text tokens──►
+                  [Talker: 語音 tokens] ──speech tokens──►
+                     [Code2Wav: PCM 音訊] ──audio chunks──► Client
+```
+
+文字 token 約在 ~1.3s 開始串流，音訊約在 ~2s 到達客戶端，不需要等待完整回覆生成。
+
+## E2E Native Tool Calling
+
+在 E2E streaming 中，Qwen3-Omni 可以原生輸出 `<tool_call>` 標籤呼叫工具：
+
+```
+語音輸入 → Thinker 開始生成 text stream
+  ├─ 偵測到 <tool_call> → 中斷音訊 → 執行工具
+  │                      → 帶結果重新呼叫 E2E → 輸出語音回答
+  └─ 未偵測到 → 正常串流音訊 (零額外延遲)
+```
+
+非工具對話完全不受影響，只有需要工具時才會多一次 E2E 呼叫。
+
+## NAT 四大擴展點運用
 
 | 擴展機制 | 用途 | 達成效果 |
 |---------|------|---------|
 | `@register_front_end` | 自定義 WebSocket 伺服器，替換 NAT 預設 FastAPI | 客戶端 100% 相容原小智協定 |
 | `@register_function` | LangGraph StateGraph Agent 取代預設 tool_calling_agent | Agent 和語音管線同進程直連，零代理延遲 |
 | `entry_points` | pyproject.toml 宣告 nat.components + nat.front_ends | `pip install` 即生效，NAT 升級不覆蓋自定義碼 |
-| `YAML _type` | 統一 xiaozhi_voice.yml 取代原來 2 份配置 | 一個檔案管理 Front End + Pipeline + Agent + Tools |
+| `YAML _type` | 統一 YAML 配置管理 Front End + Pipeline + Agent + Tools | 一個檔案管理完整語音管線 |
 
-### 移植優勢
-
-| 優勢 | 說明 |
-|------|------|
-| 延遲降低 | 移除 HTTP 代理層，Agent 呼叫改為同進程函數呼叫，每輪減少 50-100ms |
-| 維運簡化 | 服務進程從 5 減至 3，配置檔從 2 份整合為 1 份 YAML |
-| 觀測增強 | Phoenix 可追蹤完整鏈路 VAD → ASR → LLM → Tool → TTS，不再有黑箱 |
-| 擴展彈性 | NAT 新版工具（Code Exec、RAG 等）直接可用，`pip install --upgrade nvidia-nat` 不影響自定義碼 |
-| 記憶統一 | 對話記憶由 NAT Workflow 原生管理，支援 per-device-id 持久記憶 |
-| 回退安全 | `pip uninstall nat-xiaozhi-voice-agent` 即完全回退，可與原系統並行測試 |
-
-### 成果
+## 成果
 
 | 指標 | 數值 |
 |------|------|
-| Python 模組 | 15 個 |
-| NAT 擴展點 | 4 個（front_end + function + entry_points + YAML _type） |
+| Python 模組 | 18 個 (含 E2E pipeline + tool executor) |
+| NAT 擴展點 | 4 個 (front_end + function + entry_points + YAML _type) |
 | 修改 NAT 原始碼 | **0 行** |
-| 配置檔 | 1 份統一 YAML |
-| 語音管線參數一致性 | 7 項關鍵參數 100% 與原系統一致 |
+| 外部依賴 | **僅 vLLM-Omni**（無需 ASR 模型 / TTS 服務） |
 | 客戶端修改 | **零修改**——ESP32 / py-xiaozhi 直接遷移 |
 
 ## 架構
@@ -49,155 +62,163 @@
 客戶端 (ESP32 / py-xiaozhi)
     │  WebSocket (Opus audio + JSON control)
     ▼
-┌─────────────────────────────────────┐
-│  Xiaozhi Voice Agent (NAT Plugin)   │
-│                                     │
-│  ┌─────┐  ┌─────┐  ┌────────────┐  │
-│  │ VAD │→ │ ASR │→ │ LLM Agent  │  │
-│  │Silero│  │Fun  │  │ (LangGraph)│  │
-│  │     │  │ASR  │  │  + Tools   │  │
-│  └─────┘  └─────┘  └─────┬──────┘  │
-│                           │         │
-│                     ┌─────▼──────┐  │
-│                     │    TTS     │  │
-│                     │ (Edge TTS) │  │
-│                     └────────────┘  │
-└─────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│  Xiaozhi Voice Agent (NAT Plugin)            │
+│                                              │
+│  ┌─────────┐                                 │
+│  │  Silero  │  語音活動偵測                    │
+│  │   VAD    │                                │
+│  └────┬─────┘                                │
+│       │ PCM → WAV → file:// URL              │
+│       ▼                                      │
+│  ┌──────────────────────────────────────┐    │
+│  │  vLLM-Omni (Qwen3-Omni 30B-A3B)    │    │
+│  │                                      │    │
+│  │  Stage 0: Thinker (理解 + 推理)      │    │
+│  │     ├─ text stream ──► <tool_call>?  │    │
+│  │     │    ├─ Yes → Tool Executor      │    │
+│  │     │    └─ No  → 直接輸出           │    │
+│  │     ▼                                │    │
+│  │  Stage 1: Talker (語音 token)        │    │
+│  │     ▼                                │    │
+│  │  Stage 2: Code2Wav (PCM 音訊)       │    │
+│  └──────────────────────────────────────┘    │
+│       │                                      │
+│       ▼  audio chunks → resample → Opus      │
+│  ┌──────────┐                                │
+│  │ E2E Tool │  current_datetime / get_weather│
+│  │ Executor │  get_lunar / wiki_search       │
+│  └──────────┘                                │
+└──────────────────────────────────────────────┘
 ```
-
-**語音管線：**
-- **VAD** — Silero VAD (ONNX)，偵測語音活動
-- **ASR** — FunASR SenseVoiceSmall，支援中/英/日/粵語
-- **LLM** — 透過 NVIDIA NIM API 呼叫（可替換任意 OpenAI-compatible 模型）
-- **TTS** — Microsoft Edge TTS（免費雲端）或 CosyVoice（本地）
-
-**特性：**
-- 基於 LangGraph 的 ReAct Agent，支援 Tool Calling
-- 每裝置獨立對話記憶（SQLite 持久化）
-- 歷史壓縮：超過閾值時自動摘要舊對話
-- 串流 TTS：LLM 邊生成邊合成語音，降低首音延遲
 
 ## 前置需求
 
 ### 系統
 
-- Linux (x86_64 或 aarch64，已在 DGX Spark aarch64 上驗證)
+- Windows 11 + WSL2 Ubuntu 22.04 (已在 DGX Spark / RTX PRO 6000 Blackwell 驗證)
 - Python 3.11 / 3.12 / 3.13
-- [NVIDIA API Key](https://build.nvidia.com/)（用於 LLM / VLM 推論）
+- NVIDIA GPU + CUDA 12.8
 
-### 系統套件（Docker 方式免裝）
+### 硬體需求
 
-```bash
-sudo apt-get install -y libopus-dev libopus0 libsndfile1-dev
+| 項目 | 規格 |
+|------|------|
+| GPU VRAM | ~79–98 GB (Qwen3-Omni 30B-A3B BF16，async_chunk 三階段共用 GPU) |
+| 推薦 GPU | NVIDIA RTX PRO 6000 Blackwell (~98GB) / DGX Spark |
+| CUDA | 12.8 |
+| vLLM | 0.19.0+ (含 vLLM-Omni) |
+
+### Qwen3-Omni 模型
+
+```
+Qwen3-Omni-30B-A3B-Instruct
+├── Thinker (理解 + 推理)
+│   ├── ASR: 音訊輸入 → 文字 (支援 19 種語言)
+│   ├── Vision: 圖片/影片理解
+│   └── LLM: 文字推理 + 對話
+└── Talker (語音輸出)
+    └── TTS: 文字 → 語音 (支援 10 種語言, 3 種聲音)
 ```
 
-### 模型檔案（Docker 方式自動下載）
+| 聲音 | 性別 | 描述 |
+|------|------|------|
+| Chelsie | 女 | 甜蜜、柔和、溫暖清澈 |
+| Ethan | 男 | 明亮、充滿活力、溫暖親切 |
+| Aiden | 男 | 溫暖、隨和的美式口音 |
 
-原生安裝需要下載兩個模型到 `models/` 目錄：
+### 模型下載
 
 ```bash
-# 1. Silero VAD
-cd models/
-git clone https://github.com/snakers4/silero-vad.git snakers4_silero-vad
+wsl -d Ubuntu-22.04
 
-# 2. FunASR SenseVoiceSmall
+mkdir -p ~/qwen3-omni && cd ~/qwen3-omni
+
+# 下載 Qwen3-Omni 模型 (~60GB)
 pip install huggingface_hub
 python3 -c "
 from huggingface_hub import snapshot_download
-snapshot_download('FunAudioLLM/SenseVoiceSmall', local_dir='models/SenseVoiceSmall')
+snapshot_download('Qwen/Qwen3-Omni-30B-A3B-Instruct', local_dir='Qwen3-Omni-30B-A3B-Instruct')
 "
+
+# Silero VAD (輕量端點偵測)
+git clone https://github.com/snakers4/silero-vad.git snakers4_silero-vad
+```
+
+## 環境變數
+
+所有機敏資訊透過環境變數或 YAML 配置傳入，不要將 API Key 寫死在程式碼中。
+
+| 變數 | 說明 | 範例 |
+|------|------|------|
+| `QWEN3_OMNI_API_URL` | vLLM-Omni API 端點 | `http://localhost:8901/v1` |
+| `QWEN3_OMNI_MODEL` | 模型名稱或路徑 | `Qwen3-Omni-30B-A3B-Instruct` |
+| `QWEATHER_API_HOST` | QWeather API host | `devapi.qweather.com` |
+| `QWEATHER_API_KEY` | QWeather API Key | `your-api-key` |
+| `VAD_MODEL_DIR` | Silero VAD 模型目錄 | `models/snakers4_silero-vad` |
+
+在 `configs/xiaozhi_voice_e2e.yml` 中填入對應值，或建立 `.env` 檔案：
+
+```bash
+cp .env.example .env
+# 編輯 .env 填入你的設定
 ```
 
 ## 安裝
 
-有三種安裝方式。**Docker** 最快，一行啟動；**方式 A** 適合原生安裝；**方式 B** 適合開發者。
-
----
-
-### Docker（最快）
-
-需要 Docker + [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)。
+### 1. 安裝 vLLM-Omni (WSL2)
 
 ```bash
-git clone https://github.com/tommywu052/nat-xiaozhi-voice-agent.git
+wsl -d Ubuntu-22.04
+
+cd ~/qwen3-omni
+python3 -m venv venv
+source venv/bin/activate
+
+# 安裝 vLLM-Omni (含 Talker + Code2Wav 支援)
+pip install vllm-omni
+
+# 確認 CUDA
+python3 -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
+```
+
+### 2. 部署 async_chunk stage config
+
+本專案已附帶 `scripts/qwen3_omni_single_gpu_async.yaml`，複製到 WSL2 模型目錄即可：
+
+```bash
+# 從 Windows 複製到 WSL2
+cp scripts/qwen3_omni_single_gpu_async.yaml ~/qwen3-omni/
+```
+
+### 3. 安裝 NAT + Voice Agent Plugin (Windows)
+
+有兩種安裝方式。**方式 A** 最簡單；**方式 B** 適合需要修改 NAT 原始碼的情況。
+
+#### 方式 A — pip install (推薦)
+
+```bash
+git clone -b qwen-omni https://github.com/tommywu052/nat-xiaozhi-voice-agent.git
 cd nat-xiaozhi-voice-agent
 
-# 建立 .env 檔案設定 API Key
-echo 'NVIDIA_API_KEY=nvapi-YOUR_KEY' > .env
-echo 'TAVILY_API_KEY=tvly-YOUR_KEY' >> .env   # 選配
-
-# 建置並啟動（首次會自動下載模型，約 5-10 分鐘）
-docker compose up -d --build
-```
-
-啟動後 WebSocket 端點：`ws://localhost:8000/xiaozhi/v1/`
-
-```bash
-# 查看日誌
-docker compose logs -f
-
-# 停止
-docker compose down
-```
-
-> Docker image 已包含 CUDA runtime、PyTorch、ASR/VAD 模型，**不需要額外安裝任何依賴**。
-
-**啟用 USB 攝影機（explain_scene 工具）：**
-
-容器預設無法存取 host 的 USB 攝影機。如需使用 `explain_scene` 工具，編輯 `docker-compose.yml` 取消註解 `devices` 區段：
-
-```yaml
-    devices:
-      - /dev/video0:/dev/video0
-```
-
-確認攝影機裝置路徑：
-
-```bash
-ls /dev/video*
-# 通常 /dev/video0 為第一顆 USB 攝影機
-```
-
-> 如果 host 沒有接攝影機，不需要設定。`explain_scene` 被呼叫時會回傳友善的錯誤訊息，不影響其他功能。
-
----
-
-### 方式 A — pip install（原生安裝）
-
-NAT 已發佈至 PyPI（套件名 `nvidia-nat`），不需要 clone NAT repo。
-
-```bash
-git clone https://github.com/tommywu052/nat-xiaozhi-voice-agent.git
-cd nat-xiaozhi-voice-agent
-
-python3 -m venv .venv
-source .venv/bin/activate
+python -m venv .venv
+.venv\Scripts\activate    # Windows
 
 pip install -e .
 ```
 
-> `pip install -e .` 會自動安裝 `nvidia-nat[langchain]` 及所有依賴（LangChain、LangGraph、Tavily 等）。
+> `pip install -e .` 會自動安裝 `nvidia-nat[langchain]` 及所有依賴。
 
----
-
-### 方式 B — 從 NAT 原始碼安裝
-
-適合需要開發 / 除錯 NAT 核心，或想使用 git main 最新功能的情況。
+#### 方式 B — 從 NAT 原始碼安裝
 
 ```bash
 git clone -b main https://github.com/NVIDIA/NeMo-Agent-Toolkit.git
 cd NeMo-Agent-Toolkit
 git submodule update --init --recursive
 
-# 安裝 uv（如尚未安裝）
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source $HOME/.local/bin/env
-
-# 建立虛擬環境
 uv venv --python 3.12 --seed .venv
-source .venv/bin/activate
+.venv\Scripts\activate
 
-# 安裝 NAT 核心 + langchain 插件
 uv sync
 uv pip install -e ".[langchain]"
 
@@ -205,83 +226,87 @@ uv pip install -e ".[langchain]"
 uv pip install -e /path/to/nat-xiaozhi-voice-agent
 ```
 
----
+### 4. PyTorch 版本修正 (兩種方式皆需)
 
-### PyTorch 版本修正（兩種方式皆需執行）
-
-`funasr` 依賴會拉入 PyTorch，但可能安裝到不匹配的版本。
-**安裝完成後**，執行以下命令覆蓋為正確版本：
-
-**有 NVIDIA GPU + CUDA（DGX Spark / Jetson 等）— 推薦：**
+安裝過程中可能拉入不匹配的 PyTorch 版本，安裝完成後覆蓋為正確版本：
 
 ```bash
 pip install torch==2.11.0+cu128 torchaudio==2.11.0+cu128 \
     --index-url https://download.pytorch.org/whl/cu128 --reinstall
 ```
 
-> ASR 在 GPU 上比 CPU 快 ~8 倍（59ms vs 460ms，5 秒音訊）。
-> DGX Spark 的 NVIDIA GB10 有 120GB 顯存，SenseVoiceSmall 僅佔用幾百 MB。
-
-**無 GPU 或 CUDA 環境：**
-
-```bash
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-```
-
-### 設定 NAT 時區（推薦）
-
-NAT 的 `current_datetime` 工具預設回傳 UTC 時間。如果你的系統時區已正確設定（如 `Asia/Taipei`），
-執行以下命令讓工具回傳本地時間：
-
-```bash
-mkdir -p ~/.config/nat
-echo '{"fallback_timezone": "system"}' > ~/.config/nat/config.json
-```
-
-驗證系統時區：
-
-```bash
-timedatectl | grep "Time zone"
-# 預期輸出：Time zone: Asia/Taipei (CST, +0800)
-```
-
-### 設定 config
-
-編輯 `configs/xiaozhi_voice.yml`：
-
-```yaml
-# 必須修改的項目：
-llms:
-  main_llm:
-    api_key: "nvapi-YOUR_NVIDIA_API_KEY"    # 替換為你的 NVIDIA API Key
-
-general:
-  front_end:
-    vad_model_dir: "/absolute/path/to/models/snakers4_silero-vad"
-    asr_model_dir: "/absolute/path/to/models/SenseVoiceSmall"
-
-# 選配：啟用 web_search（Tavily）
-functions:
-  web_search:
-    api_key: "tvly-YOUR_TAVILY_KEY"   # 或透過環境變數 TAVILY_API_KEY 設定
-```
-
 ## 啟動
 
-```bash
-source .venv/bin/activate
-export NVIDIA_API_KEY="nvapi-YOUR_KEY"
+### Step 1: 啟動 vLLM-Omni (WSL2)
 
-nat start xiaozhi_voice \
-    --config_file /path/to/nat-xiaozhi-voice-agent/configs/xiaozhi_voice.yml
+使用專案附帶的啟動腳本：
+
+```bash
+wsl -d Ubuntu-22.04
+bash scripts/start_vllm_omni_serve.sh
+```
+
+或手動啟動：
+
+```bash
+wsl -d Ubuntu-22.04
+source ~/qwen3-omni/venv/bin/activate
+
+vllm serve $QWEN3_OMNI_MODEL_PATH \
+    --omni \
+    --stage-configs-path ~/qwen3-omni/qwen3_omni_single_gpu_async.yaml \
+    --port 8901 \
+    --host 0.0.0.0 \
+    --dtype bfloat16 \
+    --allowed-local-media-path / \
+    --stage-init-timeout 600
+```
+
+> `--omni` + `--stage-configs-path` 啟用三階段 (Thinker + Talker + Code2Wav)。
+> 缺少這兩個參數只會啟動 Thinker（純文字，無語音輸出）。
+
+### Step 2: 設定 config
+
+複製範本並填入你的環境設定：
+
+```bash
+cp .env.example .env
+# 編輯 .env
+```
+
+或直接編輯 `configs/xiaozhi_voice_e2e.yml`：
+
+```yaml
+general:
+  front_end:
+    # vLLM-Omni 端點（改為你的 WSL2 IP 或 localhost）
+    qwen3_omni_api_url: "http://localhost:8901/v1"
+    qwen3_omni_model: "Qwen3-Omni-30B-A3B-Instruct"
+
+    # VAD 模型路徑（相對或絕對）
+    vad_model_dir: "models/snakers4_silero-vad"
+
+    # 選配：天氣 API (QWeather)
+    weather_api_host: "devapi.qweather.com"
+    weather_api_key: ""   # 填入你的 QWeather API Key
+```
+
+> 查詢 WSL2 IP: `wsl -d Ubuntu-22.04 -- hostname -I`
+
+### Step 3: 啟動 Voice Agent (Windows)
+
+```bash
+cd nat-xiaozhi-voice-agent
+.venv\Scripts\activate
+
+nat start xiaozhi_voice --config_file configs/xiaozhi_voice_e2e.yml
 ```
 
 啟動成功後會看到：
 
 ```
-Voice pipeline ready (VAD + ASR + TTS)
+Voice pipeline ready (VAD + E2E Qwen3-Omni async_chunk streaming + tool calling)
 Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-LLM warm-up done in 0.77s
 ```
 
 ## 客戶端連接
@@ -289,181 +314,128 @@ LLM warm-up done in 0.77s
 WebSocket 端點：`ws://<SERVER_IP>:8000/xiaozhi/v1/`
 
 支援的客戶端：
-- **py-xiaozhi-ws.py**（本專案內建測試客戶端，見下方說明）
 - [py-xiaozhi](https://github.com/zhayujie/py-xiaozhi)（Python 桌面客戶端）
 - [xiaozhi-esp32](https://github.com/78/xiaozhi-esp32)（ESP32 硬體裝置）
 - 任何相容小智 WebSocket 協議的客戶端
-
-### 內建測試客戶端 — py-xiaozhi-ws.py
-
-專案附帶 `py-xiaozhi-ws.py`，可在桌面環境中快速測試語音對話。按住空白鍵說話，放開送出，ESC 退出。
-
-**額外依賴安裝：**
-
-```bash
-pip install pyaudio pynput pyserial
-```
-
-> `pyaudio` 需要系統安裝 PortAudio：`sudo apt-get install -y portaudio19-dev`
-
-**環境變數：**
-
-| 變數 | 預設值 | 說明 |
-|------|--------|------|
-| `XIAOZHI_DEVICE_ID` | *(無預設，必須設定)* | 裝置 ID，用於識別客戶端並綁定對話記憶 |
-| `XIAOZHI_WS_URL` | `ws://localhost:8000/xiaozhi/v1/` | Voice Agent WebSocket 端點 |
-| `XIAOZHI_CLIENT_ID` | `py-xiaozhi-ws-client` | 客戶端識別名稱 |
-| `EYE_SERIAL_PORT` | `COM10` | ESP32 眼球模組 Serial port（無硬體可忽略） |
-
-**啟動方式：**
-
-```bash
-# 最簡用法（使用預設值）
-python py-xiaozhi-ws.py
-
-# 自訂裝置 ID 與伺服器位址
-XIAOZHI_DEVICE_ID="your-device-id" \
-XIAOZHI_WS_URL="ws://192.168.1.100:8000/xiaozhi/v1/" \
-python py-xiaozhi-ws.py
-```
-
-**操作方式：**
-
-| 按鍵 | 功能 |
-|------|------|
-| 按住空白鍵 | 開始錄音 |
-| 放開空白鍵 | 停止錄音並送出 |
-| 數字鍵 0-9 | 手動切換 ESP32 眼球設計 |
-| h / a / s / u / c / n | 情緒快捷鍵（happy / angry / sad / surprised / confused / neutral） |
-| ESC | 退出程式 |
-
-**功能特色：**
-- 透過 Opus 編碼即時傳送 / 接收音訊
-- 支援 ESP32 眼球表情模組（Serial 連接，無硬體時自動略過）
-- 自動處理 TTS 播放中的打斷（按空白鍵 abort）
 
 ## API 端點
 
 | 方法 | 路徑 | 說明 |
 |------|------|------|
-| GET | `/health` | 健康檢查（回傳管線狀態） |
-| GET | `/api/memory` | 列出所有有對話記憶的裝置 |
-| DELETE | `/api/memory/{device_id}` | 清除指定裝置的對話記憶 |
-| DELETE | `/api/memory` | 清除所有裝置的對話記憶 |
+| GET | `/health` | 健康檢查（回傳管線狀態、模式、連線數） |
+
+健康檢查回傳範例：
+
+```json
+{
+  "status": "ok",
+  "connections": 1,
+  "pipeline": {
+    "mode": "e2e_streaming",
+    "vad": true,
+    "omni_e2e": true,
+    "streaming": true
+  }
+}
+```
 
 ## 內建工具
 
-所有工具預設皆已註冊，**啟動時不會報錯**。只有在 LLM 實際呼叫時才會觸發對應資源，若資源不可用會返回友善的錯誤訊息而非 crash。
+所有工具預設皆已註冊，啟動時不會報錯。E2E 模式下工具透過 Qwen3-Omni 原生 `<tool_call>` XML 標籤呼叫，由 `E2EToolExecutor` 執行。
 
 | 工具 | 執行時需求 | 說明 |
 |------|-----------|------|
-| `current_datetime` | 無 | 查詢目前日期時間（使用系統時區） |
-| `wiki_search` | 無 | 維基百科搜尋 |
-| `web_search` | Tavily API Key | 即時網路搜尋（新聞、天氣等）；無 Key 時回傳錯誤訊息 |
-| `explain_scene` | USB 攝影機 | 透過 VLM 描述攝影機畫面；無攝影機時回傳「無法開啟攝影機」 |
+| `current_datetime` | 無 | 查詢目前日期時間（Asia/Taipei 時區） |
+| `get_weather` | QWeather API Key | 即時天氣 + 3 天預報（QWeather REST API） |
+| `get_lunar` | 無 | 農曆日期、干支、生肖、節氣、黃曆宜忌（cnlunar） |
+| `wiki_search` | 無 | 中文維基百科搜尋 |
 
-### explain_scene 工具設定
+### E2E Tool Calling 流程
 
-`explain_scene` 透過 `llm_name` 引用 YAML 中定義的 LLM，共用 NVIDIA NIM endpoint 和 API Key，
-只需另外指定多模態視覺模型：
-
-```yaml
-functions:
-  explain_scene:
-    _type: explain_scene
-    camera_index: 0
-    llm_name: main_llm                      # 共用 main_llm 的 base_url 和 api_key
-    vlm_model: "google/gemma-4-31b-it"      # 多模態視覺模型
+```
+1. 用戶語音 → vLLM-Omni stream_e2e() 開始串流
+2. text stream 中偵測 <tool_call>{"name": "get_weather", "arguments": {"location": "台北"}}</tool_call>
+3. 中斷音訊串流 → E2EToolExecutor 執行工具
+4. 帶工具結果重新呼叫 stream_e2e() (text-only input)
+5. 輸出語音回答（含工具結果）
 ```
 
-也支援獨立設定（不引用 LLM）：
-
-```yaml
-functions:
-  explain_scene:
-    _type: explain_scene
-    camera_index: 0
-    vlm_base_url: "https://integrate.api.nvidia.com/v1"
-    vlm_api_key: "nvapi-YOUR_KEY"
-    vlm_model: "google/gemma-4-31b-it"
-```
-
-**NVIDIA NIM 可用的視覺模型：**
-
-| 模型 | 中文支援 | 辨識精度 | 回應速度（熱啟動） |
-|------|---------|---------|----------------|
-| `google/gemma-4-31b-it` | 優秀（繁體中文） | 高（正確辨識 RTX 5090） | ~2.5s |
-| `meta/llama-3.2-11b-vision-instruct` | 差（常用英文回覆） | 中（誤判型號） | ~8s |
-| `meta/llama-3.2-90b-vision-instruct` | 中 | 高 | ~15s |
-| `microsoft/phi-4-multimodal-instruct` | 中 | 中 | 待測 |
-
-> **推薦：** `google/gemma-4-31b-it`，中文能力最好、辨識最精準。首次呼叫有 ~35s 冷啟動，後續穩定 2-3 秒。
-
-## LLM 模型建議
-
-| 模型 | 純對話 TTFT | 帶工具 TTFT | Tool Calling 判斷 | 中文回覆品質 | 適合場景 |
-|------|-----------|-----------|-----------------|------------|---------|
-| `qwen/qwen3-next-80b-a3b-instruct` | ~0.44s | ~1.5s | 優秀（85% <2s） | 優秀 | **推薦** — 工具判斷準確、語意理解強 |
-| `meta/llama-3.1-8b-instruct` | ~0.17s | ~1.0s | 一般（常誤判） | 一般 | 低延遲純對話 |
-| `meta/llama-3.3-70b-instruct` | ~0.6s | ~12s | 完整支援 | 良好 | 複雜任務、工具密集 |
-| `nvidia/llama-3.1-nemotron-nano-8b-v1` | ~1.8s | 不支援 | 不支援 | 一般 | 純對話（不建議） |
-
-> **推薦：** 語音 Agent 首選 `qwen/qwen3-next-80b-a3b-instruct`，在工具呼叫判斷（何時該/不該用工具）和語意理解上遠優於 8B 模型。
-
-## 效能參考（DGX Spark aarch64 + qwen3-next-80b）
+## 效能參考 (RTX PRO 6000 Blackwell 98GB + Qwen3-Omni 30B-A3B)
 
 | 階段 | 延遲 |
 |------|------|
-| VAD + ASR (SenseVoiceSmall) | ~0.4s |
-| LLM 純對話 TTFT | ~0.4s |
-| LLM + 輕量工具 TTFT | ~1.5s |
-| EdgeTTS 合成 | ~0.5-1.0s |
-| VLM explain_scene（熱啟動） | ~2.5s |
-| **端到端（純對話）** | **~1.0-1.5s** |
+| VAD 端點偵測 | ~0.1s |
+| Text TTFT (首文字) | ~1.3s |
+| Audio TTFA (首音訊) | ~2.0s |
+| Tool 偵測 + 執行 | ~1.5–3.0s |
+| Tool followup 首音訊 | ~2.0s |
+| **端到端（純對話）** | **~2.0–2.5s** |
+| **端到端（含工具）** | **~4.0–5.5s** |
 
 ## 目錄結構
 
 ```
 nat-xiaozhi-voice-agent/
 ├── configs/
-│   └── xiaozhi_voice.yml          # NAT 統一配置檔
-├── models/                         # 模型檔案（需自行下載）
-│   ├── snakers4_silero-vad/        # Silero VAD ONNX 模型
-│   └── SenseVoiceSmall/            # FunASR 語音辨識模型
+│   └── xiaozhi_voice_e2e.yml              # E2E 統一配置檔
+├── scripts/                                # vLLM-Omni 啟動腳本與 stage config
+│   ├── start_vllm_omni_serve.sh           # E2E 模式啟動 (含 Talker + Code2Wav)
+│   ├── start_vllm_serve.sh                # Thinker-only 模式啟動
+│   └── qwen3_omni_single_gpu_async.yaml   # async_chunk 三階段並行配置
+├── .env.example                            # 環境變數範本
 ├── src/nat_xiaozhi_voice/
-│   ├── frontend/                   # NAT 前端插件（WebSocket 伺服器）
-│   │   ├── config.py               # Pydantic 配置定義
-│   │   ├── connection.py           # 單一連線處理（VAD→ASR→LLM→TTS）
-│   │   ├── plugin.py               # NAT FrontEndBase 實作
-│   │   ├── register.py             # NAT 前端註冊
-│   │   └── ws_server.py            # FastAPI WebSocket 伺服器
-│   ├── pipeline/                   # 語音管線元件
-│   │   ├── asr.py                  # FunASR 語音辨識
-│   │   ├── tts.py                  # Edge TTS / CosyVoice 語音合成
-│   │   └── vad.py                  # Silero VAD 語音活動偵測
-│   ├── tools/                      # 自定義 NAT 工具
-│   │   ├── register.py             # explain_scene 工具註冊（支援 llm_name 引用）
-│   │   └── vlm_camera.py           # VLM 攝影機工具
+│   ├── frontend/                       # NAT 前端插件（WebSocket 伺服器）
+│   │   ├── config.py                   # Pydantic 配置（pipeline_mode, e2e_tool_calling 等）
+│   │   ├── connection.py               # 單一連線處理（VAD → E2E streaming → Tool → Audio）
+│   │   ├── plugin.py                   # NAT FrontEndBase 實作
+│   │   ├── register.py                 # NAT 前端註冊
+│   │   └── ws_server.py                # FastAPI WebSocket 伺服器
+│   ├── pipeline/                       # 語音管線元件
+│   │   ├── omni_e2e.py                 # Qwen3-Omni E2E 核心 (stream_e2e, transcribe, 對話歷史)
+│   │   ├── tools.py                    # E2E 工具定義 + <tool_call> 解析 + E2EToolExecutor
+│   │   └── vad.py                      # Silero ONNX VAD (語音端點偵測)
 │   ├── utils/
-│   │   ├── audio_codec.py          # Opus 編解碼
-│   │   ├── audio_rate_controller.py # 音訊速率控制
-│   │   └── auth.py                 # JWT 認證
+│   │   ├── audio_codec.py              # Opus 編解碼
+│   │   ├── audio_rate_controller.py    # 音訊播放速率控制
+│   │   └── auth.py                     # HMAC 裝置驗證
 │   └── workflow/
-│       └── register.py             # LangGraph Agent 定義（含記憶壓縮）
-├── py-xiaozhi-ws.py                # 桌面測試客戶端（空白鍵對講）
-├── test_vlm.py                     # VLM 視覺模型測試腳本
-├── Dockerfile                      # Docker 容器定義
-├── docker-compose.yml              # 一鍵啟動配置
+│       └── register.py                 # LangGraph Agent 定義（NAT 框架所需）
 ├── pyproject.toml
 └── README.md
 ```
 
 ## 疑難排解
 
-**Q: `ModuleNotFoundError: No module named 'torch'` 或 `libc10_cuda.so: cannot open shared object`**
-A: PyTorch 安裝了 CUDA 版本但系統無 CUDA 驅動。強制安裝 CPU 版：
+**Q: vLLM-Omni 啟動失敗 / OOM**
+A: Qwen3-Omni 30B-A3B BF16 需要 ~79–98 GB VRAM。確認 GPU 記憶體足夠：
 ```bash
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+nvidia-smi
+```
+
+**Q: `ConnectionRefusedError` 連接 vLLM**
+A: 確認 WSL2 IP 正確且 vLLM 已啟動：
+```bash
+# 查 WSL2 IP
+wsl -d Ubuntu-22.04 -- hostname -I
+
+# 測試連通
+curl http://<WSL2_IP>:8901/v1/models
+```
+
+**Q: E2E 模式沒有音訊輸出**
+A: 確認使用 `--omni` 和 `--stage-configs-path` 啟動 vLLM-Omni。普通 `vllm serve` 只有 Thinker（純文字），不會產生語音。
+
+**Q: Tool Calling 未觸發**
+A: 確認 `e2e_tool_calling: true` 已在 YAML 中啟用。工具定義會自動附加到 system prompt，Qwen3-Omni 原生支援 `<tool_call>` 格式。
+
+**Q: E2E 音訊斷斷續續**
+A: 可能是 GPU 記憶體不足導致推論變慢。調低 `kv_cache_memory_bytes` 或 `max_num_seqs` 參數。
+
+**Q: `ModuleNotFoundError: No module named 'torch'`**
+A: PyTorch 版本不匹配。強制重裝：
+```bash
+pip install torch==2.11.0+cu128 torchaudio==2.11.0+cu128 \
+    --index-url https://download.pytorch.org/whl/cu128 --reinstall
 ```
 
 **Q: `Input tag 'wiki_search' does not match any of the expected tags`**
@@ -473,38 +445,24 @@ cd NeMo-Agent-Toolkit
 uv pip install -e ".[langchain]"
 ```
 
-**Q: `LLM 'main_llm' not found`（explain_scene 啟動失敗）**
-A: explain_scene 使用 `llm_name` 引用 LLM 時，需確保 YAML 的 `llms` 區段有對應定義。
-
-**Q: `Cannot open USB webcam (index=0)`**
-A: 無 USB 攝影機時 `explain_scene` 不會 crash，只會在被呼叫時回傳「無法開啟攝影機」的友善訊息。
-
-**Q: `current_datetime` 回傳 UTC 時間而非本地時間**
-A: 設定 NAT 時區為系統時區：
-```bash
-mkdir -p ~/.config/nat
-echo '{"fallback_timezone": "system"}' > ~/.config/nat/config.json
-```
-
-**Q: `Error code: 400 - max_completion_tokens`**
-A: 部分 NVIDIA NIM 模型不支援 `max_tokens` 參數，從 config 的 LLM 區段中移除即可。
-
-**Q: Port 8000 already in use**
+**Q: Port 8000/8901 already in use**
 A: 先清除佔用的 process：
 ```bash
-lsof -ti:8000 | xargs -r kill -9
+# Windows
+netstat -ano | findstr :8000
+taskkill /PID <PID> /F
+
+# WSL2
+lsof -ti:8901 | xargs -r kill -9
 ```
 
-**Q: LLM 回應很慢（>10s）**
-A: 可能原因：
-1. 模型太大（如 122B），換成 `qwen/qwen3-next-80b-a3b-instruct`
-2. 工具回傳資料量太大，減少 `doc_content_chars_max`
-3. 模型重複呼叫同一工具，考慮在 system prompt 中加強限制
-
 **Q: 重建 .venv 後 plugin 消失**
-A: 方式 A：重新 `pip install -e .` 即可。方式 B：`uv sync` 會重置虛擬環境，需重新安裝：
+A: 方式 A 重新 `pip install -e .`。方式 B：
 ```bash
 uv pip install -e ".[langchain]"
 uv pip install -e /path/to/nat-xiaozhi-voice-agent
 ```
-兩種方式都需要重新執行 PyTorch 版本修正步驟。
+
+## 授權
+
+MIT License

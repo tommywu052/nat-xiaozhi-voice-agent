@@ -1,0 +1,116 @@
+# Qwen3-Omni 單 GPU async_chunk 配置 (RTX PRO 6000 Blackwell, 98 GiB)
+# 基於官方 qwen3_omni_moe_async_chunk.yaml 改為單 GPU
+# async_chunk 讓三個 stage 分段並行，音訊可以邊生成邊串流
+
+async_chunk: true
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: thinker
+      max_num_seqs: 4
+      model_arch: Qwen3OmniMoeForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.90
+      kv_cache_memory_bytes: 5368709120
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      distributed_executor_backend: "mp"
+      enable_prefix_caching: false
+      max_num_batched_tokens: 8192
+      max_model_len: 8192
+      mm_processor_cache_gb: 0
+      hf_config_name: thinker_config
+      tensor_parallel_size: 1
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk
+    final_output: true
+    final_output_type: text
+    is_comprehension: true
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      top_k: 1
+      max_tokens: 2048
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.05
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: talker
+      max_num_seqs: 4
+      model_arch: Qwen3OmniMoeForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.90
+      kv_cache_memory_bytes: 5368709120
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+      max_model_len: 32768
+      mm_processor_cache_gb: 0
+      distributed_executor_backend: "mp"
+      hf_config_name: talker_config
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk
+    engine_input_source: [0]
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      detokenize: False
+      repetition_penalty: 1.05
+      stop_token_ids: [2150]
+
+  - stage_id: 2
+    stage_type: llm
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: code2wav
+      max_num_seqs: 4
+      model_arch: Qwen3OmniMoeForConditionalGeneration
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: false
+      enable_prefix_caching: false
+      engine_output_type: audio
+      gpu_memory_utilization: 0.05
+      kv_cache_memory_bytes: 2147483648
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 51200
+      hf_config_name: thinker_config
+    engine_input_source: [1]
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.1
+
+runtime:
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        codec_chunk_frames: 10
+        codec_left_context_frames: 10

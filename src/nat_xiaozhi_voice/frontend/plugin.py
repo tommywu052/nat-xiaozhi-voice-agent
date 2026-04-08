@@ -20,32 +20,13 @@ logger = logging.getLogger(__name__)
 class XiaozhiVoiceFrontEndPlugin(FrontEndBase[XiaozhiVoiceFrontEndConfig]):
     """Runs the Xiaozhi-compatible WebSocket voice server."""
 
-    def __init__(
-        self,
-        full_config: "Config",
-        agent_fn,
-        agent_stream_fn=None,
-        clear_memory_fn=None,
-        clear_all_memory_fn=None,
-        list_memory_devices_fn=None,
-    ):
+    def __init__(self, full_config: "Config", agent_fn):
         super().__init__(full_config)
         self._agent_fn = agent_fn
-        self._agent_stream_fn = agent_stream_fn
-        self._clear_memory_fn = clear_memory_fn
-        self._clear_all_memory_fn = clear_all_memory_fn
-        self._list_memory_devices_fn = list_memory_devices_fn
 
     async def run(self):
         cfg = self.front_end_config
-        server = XiaozhiWSServer(
-            cfg,
-            self._agent_fn,
-            self._agent_stream_fn,
-            clear_memory_fn=self._clear_memory_fn,
-            clear_all_memory_fn=self._clear_all_memory_fn,
-            list_memory_devices_fn=self._list_memory_devices_fn,
-        )
+        server = XiaozhiWSServer(cfg, self._agent_fn)
 
         logger.info(
             "Starting Xiaozhi Voice Agent on %s:%d%s",
@@ -57,8 +38,6 @@ class XiaozhiVoiceFrontEndPlugin(FrontEndBase[XiaozhiVoiceFrontEndConfig]):
             host=cfg.host,
             port=cfg.port,
             log_level="info",
-            ws_ping_interval=30,
-            ws_ping_timeout=120,
         )
         uv_server = uvicorn.Server(uv_config)
         try:

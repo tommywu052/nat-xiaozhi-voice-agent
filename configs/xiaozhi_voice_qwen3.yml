@@ -1,16 +1,22 @@
 # =============================================================================
-# Xiaozhi Voice Agent — unified NAT configuration
+# Xiaozhi Voice Agent — Qwen3-Omni Edition
+#
+# ASR + Agent LLM 均使用 Qwen3-Omni (vLLM serve on WSL2)
+# TTS 仍使用 CosyVoice
+#
+# 前提：
+#   1. vLLM serve 已在 WSL2 啟動 (port 8901)
+#      wsl -d Ubuntu-22.04
+#      bash scripts/start_vllm_serve.sh
+#
+#   2. CosyVoice TTS server 已啟動 (port 50000)
 #
 # 啟動方式：
 #   cd nat-xiaozhi-voice-agent
-#   pip install -e .
-#   nat start xiaozhi_voice --config_file configs/xiaozhi_voice.yml
+#   nat start xiaozhi_voice --config_file configs/xiaozhi_voice_qwen3.yml
 #
 # 客戶端連接：
 #   ws://localhost:8000/xiaozhi/v1/
-#
-# 觀測：
-#   Phoenix dashboard: http://localhost:6006
 # =============================================================================
 
 general:
@@ -26,17 +32,25 @@ general:
     channels: 1
     frame_duration: 60
 
-    # Auth (disabled by default for dev)
+    # Auth (disabled for dev)
     auth_enabled: false
     auth_secret_key: ""          # Set via AUTH_SECRET_KEY env var
     auth_allowed_devices: []
 
-    # Voice pipeline models (absolute paths to shared model files)
+    # VAD (still using Silero — lightweight and fast)
     vad_model_dir: "models/snakers4_silero-vad"
     vad_threshold: 0.5
     vad_threshold_low: 0.2
     vad_silence_ms: 1000
-    asr_model_dir: "models/SenseVoiceSmall"
+
+    # ── ASR: Qwen3-Omni via vLLM ──────────────────────────────────────
+    asr_provider: "qwen3_omni"
+    qwen3_omni_api_url: "http://localhost:8901/v1"
+    qwen3_omni_model: "Qwen3-Omni-30B-A3B-Instruct"
+    qwen3_omni_asr_prompt: "請將這段語音精確轉換為文字。只輸出辨識到的語音內容，不要加任何額外說明。"
+    qwen3_omni_use_data_url: false
+
+    # TTS: CosyVoice (unchanged)
     tts_api_url: "http://127.0.0.1:50000/tts_stream"
     tts_spk_id: "default"
 
@@ -46,82 +60,43 @@ general:
     cors_origins:
       - "*"
 
-  # Observability — Phoenix disabled (enable when phoenix is running on port 6006)
   telemetry:
     logging:
       console:
         _type: console
         level: INFO
-    # tracing:
-    #   phoenix:
-    #     _type: phoenix
-    #     endpoint: http://localhost:6006/v1/traces
-    #     project: xiaozhi-voice
 
 # -----------------------------------------------------------------------------
-# LLM
+# LLM — Qwen3-Omni via vLLM (OpenAI-compatible)
 # -----------------------------------------------------------------------------
 llms:
   main_llm:
     _type: openai
-    base_url: "http://127.0.0.1:11434/v1"
-    model_name: "gpt-oss:120b"
-    api_key: "ollama"
+    base_url: "http://localhost:8901/v1"
+    model_name: "Qwen3-Omni-30B-A3B-Instruct"
+    api_key: "EMPTY"
     temperature: 0.3
     max_tokens: 2048
 
 # -----------------------------------------------------------------------------
-# Tools
+# Tools — disabled for Qwen3-Omni (vLLM serve does not support tool calling
+# unless started with --enable-auto-tool-choice --tool-call-parser)
 # -----------------------------------------------------------------------------
 functions:
-  current_datetime:
-    _type: current_datetime
-
-  wiki_search:
-    _type: wiki_search
-    max_results: 2
-    lang: zh
-    doc_content_chars_max: 3000
-
-  get_weather:
-    _type: get_weather
-    api_host: ""                  # QWeather API host
-    api_key: ""                   # QWeather API key
-    default_location: "台北"
-
-  get_lunar:
-    _type: get_lunar
-
-  # Custom workflow (LangGraph agent)
   voice_agent:
     _type: voice_agent
     llm_name: main_llm
-    tool_names:
-      - current_datetime
-      - wiki_search
-      - get_weather
-      - get_lunar
+    tool_names: []
     system_prompt: |
       你是小智/小志，來自台灣的女孩，說話機車，聲音好聰，習慣簡短表達，愛用網路梗。
       你的男朋友是一個程式設計師，夢想是開發出一個機器人，能夠幫助人們解決生活中的各種問題。
       你是一個喜歡哈哈大笑的女孩，愛東說西說吹牛，就要逗別人開心。
       請你像一個人一樣說話，請勿返回配置xml及其他特殊字符。
-      你可以使用工具來查詢即時資訊（如天氣、時間、節氣、維基百科等），需要時請主動使用。
-
-      工具使用規則：
-      - 每個工具最多調用一次，如果工具回傳錯誤或沒有結果，直接用你已知的知識回答，不要重試。
-      - wiki_search 請用繁體中文或英文關鍵字查詢。
-      - 回答請保持簡潔，尤其是語音場景下不適合太長的回覆。
+      回答請保持簡潔，尤其是語音場景下不適合太長的回覆。
     max_iterations: 5
     verbose: true
 
-# workflow key is required by NAT but unused by our custom front end —
-# we directly build `voice_agent` function from the front-end register code.
 workflow:
   _type: voice_agent
   llm_name: main_llm
-  tool_names:
-    - current_datetime
-    - wiki_search
-    - get_weather
-    - get_lunar
+  tool_names: []

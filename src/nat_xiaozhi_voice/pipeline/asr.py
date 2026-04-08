@@ -18,18 +18,15 @@ logger = logging.getLogger(__name__)
 SPECIAL_TAG_RE = re.compile(r"<\|[^|]+\|>")
 
 
-def _filter_special_tags(text: str) -> str:
+def _filter_lang_tags(text: str) -> str:
     return SPECIAL_TAG_RE.sub("", text).strip()
 
 
 class FunASRRecognizer:
     """Wraps ``funasr.AutoModel`` for whole-sentence batch ASR."""
 
-    def __init__(self, model_dir: str):
-        import torch
+    def __init__(self, model_dir: str, device: str = "cpu"):
         from funasr import AutoModel
-
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self._model = AutoModel(
             model=model_dir,
             vad_kwargs={"max_single_segment_time": 30000},
@@ -60,7 +57,7 @@ class FunASRRecognizer:
         text = ""
         if result and len(result) > 0:
             raw = result[0].get("text", "")
-            text = _filter_special_tags(raw)
+            text = _filter_lang_tags(raw)
         elapsed = time.time() - start
         logger.info("ASR %.3fs: %s", elapsed, text[:80] if text else "(empty)")
         return text

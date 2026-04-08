@@ -31,11 +31,38 @@ class XiaozhiVoiceFrontEndConfig(FrontEndBaseConfig, name="xiaozhi_voice"):
     vad_threshold: float = Field(default=0.5)
     vad_threshold_low: float = Field(default=0.2)
     vad_silence_ms: int = Field(default=1000)
+
+    # ASR provider: "funasr" (local SenseVoice) or "qwen3_omni" (vLLM API)
+    asr_provider: str = Field(default="funasr")
     asr_model_dir: str = Field(default="models/SenseVoiceSmall")
-    tts_type: str = Field(default="cosyvoice", description="TTS backend: cosyvoice | edge")
+    # Qwen3-Omni ASR settings (used when asr_provider == "qwen3_omni")
+    qwen3_omni_api_url: str = Field(default="http://localhost:8901/v1")
+    qwen3_omni_model: str = Field(default="Qwen3-Omni-30B-A3B-Instruct")
+    qwen3_omni_asr_prompt: str = Field(
+        default="請將這段語音精確轉換為文字。只輸出辨識到的語音內容，不要加任何額外說明。"
+    )
+    qwen3_omni_use_data_url: bool = Field(default=False)
+
     tts_api_url: str = Field(default="http://127.0.0.1:50000/tts_stream")
     tts_spk_id: str = Field(default="default")
-    tts_voice: str = Field(default="zh-TW-HsiaoChenNeural", description="Edge TTS voice name")
+
+    # Pipeline mode: "separate" (ASR→LLM→TTS) or "e2e" (single Qwen3-Omni call)
+    pipeline_mode: str = Field(default="separate")
+    # When True and pipeline_mode=="e2e", uses streaming 3-stage API with
+    # async_chunk for ~2s time-to-first-audio.  Requires vLLM-Omni started
+    # with an async_chunk stage config (qwen3_omni_single_gpu_async.yaml).
+    omni_e2e_streaming: bool = Field(default=False)
+    omni_e2e_system_prompt: str = Field(
+        default="You are Qwen, a virtual human capable of perceiving auditory inputs "
+                "and generating text and speech. You are a helpful assistant."
+    )
+    omni_e2e_user_prompt: str = Field(default="請聽這段語音並回覆。")
+
+    # E2E Tool Calling — enables Qwen3-Omni native function calling in E2E mode
+    e2e_tool_calling: bool = Field(default=False)
+    weather_api_host: str = Field(default="")
+    weather_api_key: str = Field(default="")
+    weather_default_location: str = Field(default="台北")
 
     # Timeouts
     close_no_voice_seconds: int = Field(default=120)

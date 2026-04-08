@@ -11,39 +11,17 @@ version = "0.1.0"
 requires-python = ">=3.11,<3.14"
 description = "Xiaozhi Voice Agent — custom NAT front-end + voice pipeline for ESP32 / py-xiaozhi clients"
 dependencies = [
-    # NeMo Agent Toolkit (core + langchain plugin)
-    "nvidia-nat[langchain]",
-
-    # Voice pipeline
     "opuslib-next",
-    "onnxruntime",
-    "funasr",
-    "torch",
-    "torchaudio",
-
-    # TTS
-    "edge-tts",
-    "miniaudio",
     "aiohttp",
-
-    # LangGraph agent + memory
-    "aiosqlite",
-    "langgraph-checkpoint-sqlite",
-    "openai",
-
-    # Server
     "fastapi",
     "uvicorn",
     "starlette",
     "numpy",
-
-    # Optional: VLM camera tool (headless for Docker/server environments)
-    "opencv-python-headless",
+    "cnlunar",
 ]
 
 [project.entry-points.'nat.components']
 nat_xiaozhi_voice_workflow = "nat_xiaozhi_voice.workflow.register"
-nat_xiaozhi_voice_tools = "nat_xiaozhi_voice.tools.register"
 
 [project.entry-points.'nat.front_ends']
 nat_xiaozhi_voice_frontend = "nat_xiaozhi_voice.frontend.register"
