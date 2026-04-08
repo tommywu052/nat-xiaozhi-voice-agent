@@ -6,6 +6,28 @@
 
 將原本小智 AI 的多進程雙系統架構，完整移植為 **NAT 自定義元件**——15 個 Python 模組、0 行 NAT 原始碼修改、1 份統一 YAML 配置，以 `pip install` 套件形式獨立運作。
 
+---
+
+### Qwen3-Omni 端到端版本
+
+> **有大 VRAM GPU？** 試試 [`qwen-omni`](https://github.com/tommywu052/nat-xiaozhi-voice-agent/tree/qwen-omni) 分支——使用 Qwen3-Omni 單次 API 呼叫同時完成語音理解、推理、語音合成，不需要外部 ASR 或 TTS 服務。
+
+| | `main` (本分支) | [`qwen-omni`](https://github.com/tommywu052/nat-xiaozhi-voice-agent/tree/qwen-omni) |
+|---|---|---|
+| **語音管線** | VAD → FunASR → LLM → CosyVoice/EdgeTTS | VAD → **Qwen3-Omni E2E** (Thinker+Talker+Code2Wav) |
+| **模型呼叫** | ASR 1 次 + LLM 1 次 + TTS 1 次 | **單次** Qwen3-Omni API |
+| **外部依賴** | ASR 模型 + LLM API + TTS 服務 | **僅 vLLM-Omni** |
+| **GPU 需求** | 可 CPU-only（ASR 本地，LLM 雲端） | ~79–98 GB VRAM (Qwen3-Omni 30B-A3B BF16) |
+| **首音延遲** | ~1.0–1.5s | ~2.0–2.5s (async_chunk streaming) |
+| **Tool Calling** | LangGraph Agent | Qwen3-Omni 原生 `<tool_call>` 標籤 |
+
+```bash
+# 切換到 Qwen3-Omni 端到端版本
+git checkout qwen-omni
+```
+
+---
+
 ### Demo
 
 [![NAT Voice Agent Demo](docs/demo-thumbnail.png)](https://youtu.be/F58cTtn1T2I)
