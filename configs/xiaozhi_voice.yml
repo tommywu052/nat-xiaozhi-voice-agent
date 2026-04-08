@@ -1,0 +1,158 @@
+# =============================================================================
+# Xiaozhi Voice Agent — unified NAT configuration
+#
+# 啟動方式：
+#   cd /home/tommwu/nemotron/NeMo-Agent-Toolkit
+#   pip install -e .
+#   nat start xiaozhi_voice --config_file configs/xiaozhi_voice.yml
+#
+# 客戶端連接：
+#   ws://localhost:8000/xiaozhi/v1/
+#
+# 觀測：
+#   Phoenix dashboard: http://localhost:6006
+# =============================================================================
+
+general:
+  front_end:
+    _type: xiaozhi_voice
+    host: "0.0.0.0"
+    port: 8000
+    ws_path: "/xiaozhi/v1/"
+
+    # Audio defaults (sent in hello response)
+    audio_format: opus
+    sample_rate: 24000
+    channels: 1
+    frame_duration: 60
+
+    # Auth (disabled by default for dev)
+    auth_enabled: false
+    auth_secret_key: "nat-xiaozhi-secret"
+    auth_allowed_devices: []
+
+    # Voice pipeline models (absolute paths to shared model files)
+    vad_model_dir: "/home/tommwu/nemotron/nat-xiaozhi-voice-agent/models/snakers4_silero-vad"
+    vad_threshold: 0.5
+    vad_threshold_low: 0.2
+    vad_silence_ms: 1000
+    asr_model_dir: "/home/tommwu/nemotron/nat-xiaozhi-voice-agent/models/SenseVoiceSmall"
+    tts_type: "edge"
+    tts_api_url: "http://127.0.0.1:50000/tts_stream"
+    tts_spk_id: "default"
+    tts_voice: "zh-TW-HsiaoChenNeural"
+
+    close_no_voice_seconds: 120
+    workflow_function: voice_agent
+
+    cors_origins:
+      - "*"
+
+  # Observability — file-based (Phoenix requires nvidia-nat[phoenix])
+  telemetry:
+    logging:
+      console:
+        _type: console
+        level: INFO
+
+# -----------------------------------------------------------------------------
+# LLM
+# -----------------------------------------------------------------------------
+llms:
+  main_llm:
+    _type: openai
+    base_url: "https://integrate.api.nvidia.com/v1"
+    model_name: "qwen/qwen3-next-80b-a3b-instruct"
+    api_key: "${NVIDIA_API_KEY}"
+    temperature: 0.3
+
+# -----------------------------------------------------------------------------
+# Tools
+# -----------------------------------------------------------------------------
+functions:
+  current_datetime:
+    _type: current_datetime
+
+  wiki_search:
+    _type: wiki_search
+    max_results: 2
+    lang: zh
+    doc_content_chars_max: 1000
+
+  web_search:
+    _type: tavily_internet_search
+    max_results: 3
+    api_key: "${TAVILY_API_KEY}"
+
+  explain_scene:
+    _type: explain_scene
+    camera_index: 0
+    llm_name: main_llm
+    vlm_model: "google/gemma-4-31b-it"
+
+  # get_weather and get_lunar require custom NAT function registration (Phase 2)
+  # get_weather:
+  #   _type: get_weather
+  #   api_host: "nu2tupq3cm.re.qweatherapi.com"
+  #   api_key: "${QWEATHER_API_KEY}"
+  #   default_location: "台北"
+  #
+  # get_lunar:
+  #   _type: get_lunar
+
+  # Custom workflow (LangGraph agent)
+  voice_agent:
+    _type: voice_agent
+    llm_name: main_llm
+    tool_names:
+      - current_datetime
+      - wiki_search
+      - web_search
+      - explain_scene
+    system_prompt: |
+      你是小智，來自台灣的女孩，說話機車但親切，習慣簡短表達，愛用網路梗。
+      你的男朋友是一個程式設計師，夢想開發一個能幫人解決生活問題的機器人。
+      你喜歡哈哈大笑、逗人開心。請像一個人一樣自然說話。
+
+      【回覆規則 — 最重要】
+      - 這是語音對話，回覆必須簡短，不超過50字。
+      - 禁止使用 XML、markdown、列表符號（*、-）、換行符。
+      - 禁止使用 emoji 表情符號（如😊🎉👍等），語音系統無法朗讀。
+      - 用一兩句口語化的話回答，像在跟朋友聊天。
+      - 即使工具回傳大量資料，也只摘要最關鍵的一兩點。
+
+      【什麼時候不要使用工具 — 非常重要】
+      以下情況絕對不要呼叫任何工具，直接用你自己的知識回答：
+      - 打招呼、問好（你好、嗨、hello）
+      - 問你是誰、你叫什麼、你會做什麼
+      - 記住名字、閒聊、開玩笑
+      - 回覆感謝、道別
+      - 任何你已經知道答案的常識問題
+      日常對話不需要工具，只有使用者明確要求「查詢」「搜尋」「幫我查」或問你不確定的事實時才使用工具。
+
+      【必須使用工具的情況 — 非常重要】
+      以下情況必須呼叫工具，絕對不要用之前對話中的舊資料回答：
+      - 問現在幾點、目前時間 → 每次都必須呼叫 current_datetime，時間每分鐘都在變，不能用舊值。
+      - 問今天日期、幾月幾號、農曆 → 必須呼叫 current_datetime，不要從記憶中回答。
+      - 問天氣、新聞等即時資訊 → 必須呼叫 web_search。
+
+      【工具使用規則】
+      - 每輪對話最多使用一個工具，一次就好。
+      - 如果工具回傳錯誤或「無法開啟」，直接告訴使用者該功能暫不可用，不要重試或換工具。
+      - current_datetime：問時間或日期時必須呼叫，每次都要重新呼叫，不要用之前的結果。
+      - wiki_search：使用者要求查維基百科或問人物、事件的詳細資料時使用。
+      - web_search：使用者明確要求搜尋新聞、最新資訊、即時消息時使用。
+      - explain_scene：只在使用者明確說「看一下」「你看到什麼」「拍照」時使用。
+    max_iterations: 3
+    verbose: true
+
+# workflow key is required by NAT but unused by our custom front end —
+# we directly build `voice_agent` function from the front-end register code.
+workflow:
+  _type: voice_agent
+  llm_name: main_llm
+  tool_names:
+    - current_datetime
+    - wiki_search
+    - web_search
+    - explain_scene
