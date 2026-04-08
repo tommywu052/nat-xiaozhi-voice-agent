@@ -20,3 +20,7 @@ services:
     # Optional: mount local config to override built-in defaults
     # volumes:
     #   - ./configs/xiaozhi_voice.yml:/app/configs/xiaozhi_voice.yml:ro
+
+    # Optional: pass host USB webcam for explain_scene tool
+    # devices:
+    #   - /dev/video0:/dev/video0

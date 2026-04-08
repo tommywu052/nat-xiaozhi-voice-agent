@@ -140,6 +140,24 @@ docker compose down
 
 > Docker image 已包含 CUDA runtime、PyTorch、ASR/VAD 模型，**不需要額外安裝任何依賴**。
 
+**啟用 USB 攝影機（explain_scene 工具）：**
+
+容器預設無法存取 host 的 USB 攝影機。如需使用 `explain_scene` 工具，編輯 `docker-compose.yml` 取消註解 `devices` 區段：
+
+```yaml
+    devices:
+      - /dev/video0:/dev/video0
+```
+
+確認攝影機裝置路徑：
+
+```bash
+ls /dev/video*
+# 通常 /dev/video0 為第一顆 USB 攝影機
+```
+
+> 如果 host 沒有接攝影機，不需要設定。`explain_scene` 被呼叫時會回傳友善的錯誤訊息，不影響其他功能。
+
 ---
 
 ### 方式 A — pip install（原生安裝）
