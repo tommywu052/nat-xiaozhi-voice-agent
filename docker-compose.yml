@@ -1,0 +1,22 @@
+services:
+  voice-agent:
+    build: .
+    image: nat-xiaozhi-voice-agent:latest
+    container_name: xiaozhi-voice-agent
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - TZ=${TZ:-Asia/Taipei}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Optional: mount local config to override built-in defaults
+    # volumes:
+    #   - ./configs/xiaozhi_voice.yml:/app/configs/xiaozhi_voice.yml:ro

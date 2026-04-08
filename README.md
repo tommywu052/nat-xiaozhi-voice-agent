@@ -83,15 +83,15 @@
 - Python 3.11 / 3.12 / 3.13
 - [NVIDIA API Key](https://build.nvidia.com/)（用於 LLM / VLM 推論）
 
-### 系統套件
+### 系統套件（Docker 方式免裝）
 
 ```bash
 sudo apt-get install -y libopus-dev libopus0 libsndfile1-dev
 ```
 
-### 模型檔案
+### 模型檔案（Docker 方式自動下載）
 
-需要下載兩個模型到 `models/` 目錄：
+原生安裝需要下載兩個模型到 `models/` 目錄：
 
 ```bash
 # 1. Silero VAD
@@ -108,7 +108,41 @@ snapshot_download('FunAudioLLM/SenseVoiceSmall', local_dir='models/SenseVoiceSma
 
 ## 安裝
 
-有兩種安裝方式。**方式 A** 最簡單，適合大多數使用者；**方式 B** 適合需要修改 NAT 原始碼或使用最新開發版的情況。
+有三種安裝方式。**Docker** 最快，一行啟動；**方式 A** 適合原生安裝；**方式 B** 適合開發者。
+
+---
+
+### Docker（最快）
+
+需要 Docker + [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)。
+
+```bash
+git clone https://github.com/tommywu052/nat-xiaozhi-voice-agent.git
+cd nat-xiaozhi-voice-agent
+
+# 建立 .env 檔案設定 API Key
+echo 'NVIDIA_API_KEY=nvapi-YOUR_KEY' > .env
+echo 'TAVILY_API_KEY=tvly-YOUR_KEY' >> .env   # 選配
+
+# 建置並啟動（首次會自動下載模型，約 5-10 分鐘）
+docker compose up -d --build
+```
+
+啟動後 WebSocket 端點：`ws://localhost:8000/xiaozhi/v1/`
+
+```bash
+# 查看日誌
+docker compose logs -f
+
+# 停止
+docker compose down
+```
+
+> Docker image 已包含 CUDA runtime、PyTorch、ASR/VAD 模型，**不需要額外安裝任何依賴**。
+
+---
+
+### 方式 A — pip install（原生安裝）
 
 ---
 
@@ -117,7 +151,7 @@ snapshot_download('FunAudioLLM/SenseVoiceSmall', local_dir='models/SenseVoiceSma
 NAT 已發佈至 PyPI（套件名 `nvidia-nat`），不需要 clone NAT repo。
 
 ```bash
-git clone https://github.com/user/nat-xiaozhi-voice-agent.git
+git clone https://github.com/tommywu052/nat-xiaozhi-voice-agent.git
 cd nat-xiaozhi-voice-agent
 
 python3 -m venv .venv
@@ -402,6 +436,8 @@ nat-xiaozhi-voice-agent/
 │       └── register.py             # LangGraph Agent 定義（含記憶壓縮）
 ├── py-xiaozhi-ws.py                # 桌面測試客戶端（空白鍵對講）
 ├── test_vlm.py                     # VLM 視覺模型測試腳本
+├── Dockerfile                      # Docker 容器定義
+├── docker-compose.yml              # 一鍵啟動配置
 ├── pyproject.toml
 └── README.md
 ```

@@ -32,11 +32,11 @@ general:
     auth_allowed_devices: []
 
     # Voice pipeline models (absolute paths to shared model files)
-    vad_model_dir: "/home/tommwu/nemotron/nat-xiaozhi-voice-agent/models/snakers4_silero-vad"
+    vad_model_dir: "${VAD_MODEL_DIR:-models/snakers4_silero-vad}"
     vad_threshold: 0.5
     vad_threshold_low: 0.2
     vad_silence_ms: 1000
-    asr_model_dir: "/home/tommwu/nemotron/nat-xiaozhi-voice-agent/models/SenseVoiceSmall"
+    asr_model_dir: "${ASR_MODEL_DIR:-models/SenseVoiceSmall}"
     tts_type: "edge"
     tts_api_url: "http://127.0.0.1:50000/tts_stream"
     tts_spk_id: "default"
