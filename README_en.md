@@ -46,23 +46,23 @@ The original Xiaozhi AI multi-process dual-system architecture has been fully mi
 ## Architecture
 
 ```
-Client (ESP32 / py-xiaozhi)
-    │  WebSocket (Opus audio + JSON control)
-    ▼
-┌─────────────────────────────────────┐
-│  Xiaozhi Voice Agent (NAT Plugin)   │
-│                                     │
-│  ┌─────┐  ┌─────┐  ┌────────────┐  │
-│  │ VAD │→ │ ASR │→ │ LLM Agent  │  │
-│  │Silero│  │Fun  │  │ (LangGraph)│  │
-│  │     │  │ASR  │  │  + Tools   │  │
-│  └─────┘  └─────┘  └─────┬──────┘  │
-│                           │         │
-│                     ┌─────▼──────┐  │
-│                     │    TTS     │  │
-│                     │ (Edge TTS) │  │
-│                     └────────────┘  │
-└─────────────────────────────────────┘
+Voice Client (ESP32 / py-xiaozhi)         Robot Camera (camera_server.py)
+    │  WebSocket (Opus audio + JSON)           │  WebSocket --relay
+    ▼                                          ▼
+┌──────────────────────────────────────────────────┐
+│  Xiaozhi Voice Agent (NAT Plugin)   port 8000    │
+│                                                  │
+│  ┌─────┐  ┌─────┐  ┌────────────┐               │
+│  │ VAD │→ │ ASR │→ │ LLM Agent  │──explain_scene │
+│  │Silero│  │Fun  │  │ (LangGraph)│   ↕ Relay     │
+│  │     │  │ASR  │  │  + Tools   │               │
+│  └─────┘  └─────┘  └─────┬──────┘               │
+│                           │                      │
+│                     ┌─────▼──────┐               │
+│                     │    TTS     │               │
+│                     │ (Edge TTS) │               │
+│                     └────────────┘               │
+└──────────────────────────────────────────────────┘
 ```
 
 **Voice Pipeline:**
@@ -142,9 +142,11 @@ docker compose down
 
 > The Docker image includes CUDA runtime, PyTorch, ASR/VAD models — **no additional dependencies needed**.
 
-**Enable USB Webcam (explain_scene tool):**
+**Enable explain_scene Camera:**
 
-The container cannot access host USB cameras by default. To enable the `explain_scene` tool, uncomment the `devices` section in `docker-compose.yml`:
+Option A — **Remote Robot Camera via Relay (recommended):** No Docker changes needed. Set `relay_enabled: true` in the mounted YAML config, then connect the robot with `camera_server.py --relay ws://NAT_SERVER:8000/ws/robot`.
+
+Option B — **Local USB Webcam:** The container cannot access host USB cameras by default. Uncomment the `devices` section in `docker-compose.yml`:
 
 ```yaml
     devices:
@@ -158,7 +160,7 @@ ls /dev/video*
 # Usually /dev/video0 is the first USB camera
 ```
 
-> If no camera is connected, no configuration needed. `explain_scene` returns a friendly error message when called without a camera.
+> If no camera is connected and no robot is relayed, `explain_scene` returns a friendly error message when called.
 
 ---
 
@@ -285,17 +287,20 @@ LLM warm-up done in 0.77s
 
 ## Client Connection
 
-WebSocket endpoint: `ws://<SERVER_IP>:8000/xiaozhi/v1/`
+| Endpoint | Purpose |
+|----------|---------|
+| `ws://<SERVER_IP>:8000/xiaozhi/v1/` | Voice client (ESP32 / py-xiaozhi) |
+| `ws://<SERVER_IP>:8000/ws/robot` | Robot camera relay (when relay_enabled: true) |
 
-Supported clients:
-- **py-xiaozhi-ws.py** (built-in test client, see below)
+Supported voice clients:
+- **client/py-xiaozhi-ws.py** (built-in test client, see below)
 - [py-xiaozhi](https://github.com/zhayujie/py-xiaozhi) (Python desktop client)
 - [xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) (ESP32 hardware device)
 - Any client compatible with the Xiaozhi WebSocket protocol
 
-### Built-in Test Client — py-xiaozhi-ws.py
+### Built-in Test Client — client/py-xiaozhi-ws.py
 
-The project includes `py-xiaozhi-ws.py` for quick desktop voice testing. Hold spacebar to talk, release to send, ESC to quit.
+The project includes `client/py-xiaozhi-ws.py` for quick desktop voice testing. Hold spacebar to talk, release to send, ESC to quit.
 
 **Additional dependencies:**
 
@@ -318,12 +323,12 @@ pip install pyaudio pynput pyserial
 
 ```bash
 # Basic (using defaults)
-python py-xiaozhi-ws.py
+python client/py-xiaozhi-ws.py
 
 # Custom device ID and server
 XIAOZHI_DEVICE_ID="your-device-id" \
 XIAOZHI_WS_URL="ws://192.168.1.100:8000/xiaozhi/v1/" \
-python py-xiaozhi-ws.py
+python client/py-xiaozhi-ws.py
 ```
 
 **Controls:**
@@ -341,14 +346,79 @@ python py-xiaozhi-ws.py
 - ESP32 eye expression module support (Serial, auto-skipped if no hardware)
 - Auto-handles TTS interruption (press spacebar to abort)
 
+## Robot Camera Relay
+
+When the Robot (e.g., ESP32 device, Raspberry Pi, Windows PC) has a dynamic IP or sits behind NAT, use the built-in WebSocket Relay so the Robot **actively connects into** the NAT server — no need to know the Robot's IP.
+
+### Architecture
+
+```
+Robot (dynamic IP)                         NAT Server (fixed/known IP)
+┌──────────────────┐                      ┌─────────────────────────────────────┐
+│ camera_server.py │                      │  Xiaozhi Voice Agent (port 8000)   │
+│   --relay ws://  │──WebSocket connect──→│    /xiaozhi/v1/  (voice WS)        │
+│   NAT:8000/ws/   │                      │    /ws/robot     (camera relay)    │
+│   robot          │  ←──capture request──│    /health       (health check)    │
+│                  │  ──image response──→ │                                     │
+└──────────────────┘                      └─────────────────────────────────────┘
+```
+
+### Setup Steps
+
+**Step 1 — Enable relay in NAT config (YAML):**
+
+```yaml
+general:
+  front_end:
+    relay_enabled: true    # Enables the /ws/robot WebSocket endpoint
+```
+
+**Step 2 — Start NAT server (single command; relay starts automatically):**
+
+```bash
+nat start xiaozhi_voice --config_file configs/xiaozhi_voice.yml
+```
+
+**Step 3 — Connect the Robot:**
+
+```bash
+# On the Robot machine, install dependencies
+pip install opencv-python websockets
+
+# Connect to the NAT server's relay
+python client/camera_server.py --relay ws://NAT_SERVER_IP:8000/ws/robot
+```
+
+### Verify Connection
+
+```bash
+# Check health endpoint — robot_connected should be true
+curl http://localhost:8000/health
+# {"status":"ok","connections":0,"pipeline":{...},"robot_connected":true}
+```
+
+### camera_server.py Modes
+
+| Mode | Command | Description |
+|------|---------|-------------|
+| **Relay** | `--relay ws://NAT:8000/ws/robot` | Recommended. Robot connects into NAT; dynamic IP is fine |
+| **HTTP** | `--port 9903` | Direct connection. NAT must know Robot IP |
+| **MCP stdio** | `--mcp` | Legacy Xiaozhi Cloud compatibility mode |
+
+### Performance
+
+The relay architecture has zero negative performance impact. Camera capture via the in-process WebSocket bridge takes only **0.02-0.03s**, faster than direct HTTP (0.06s).
+
 ## API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Health check (returns pipeline status) |
+| GET | `/health` | Health check (returns pipeline status + robot_connected) |
 | GET | `/api/memory` | List all devices with conversation memory |
 | DELETE | `/api/memory/{device_id}` | Clear conversation memory for a device |
 | DELETE | `/api/memory` | Clear all conversation memory |
+| WS | `/xiaozhi/v1/` | Voice client WebSocket (ESP32 / py-xiaozhi) |
+| WS | `/ws/robot` | Robot camera relay WebSocket (when relay_enabled: true) |
 
 ## Built-in Tools
 
@@ -359,30 +429,59 @@ All tools are registered at startup **without errors**. Resources are only acces
 | `current_datetime` | None | Query current date/time (uses system timezone) |
 | `wiki_search` | None | Wikipedia search |
 | `web_search` | Tavily API Key | Real-time web search (news, weather, etc.); returns error if no key |
-| `explain_scene` | USB webcam | Describe camera view via VLM; returns "cannot open camera" if no webcam |
+| `explain_scene` | Camera (relay / HTTP / USB) | Describe camera view via VLM; supports remote robot camera relay |
 
 ### explain_scene Configuration
 
-`explain_scene` references an LLM defined in YAML via `llm_name`, sharing the NVIDIA NIM endpoint and API key. Only the multimodal vision model needs to be specified separately:
+`explain_scene` supports three camera sources (by priority):
+
+| Priority | Source | Use Case |
+|:---:|--------|----------|
+| 1 | **Built-in Relay** — Robot connects via WebSocket to NAT | Dynamic Robot IP / cross-network (recommended) |
+| 2 | **Remote HTTP** — NAT connects directly to Robot camera server | Fixed Robot IP, same subnet |
+| 3 | **Local USB** — NAT server's local webcam | Development / all-in-one deployment |
+
+**Mode 1 — Built-in Relay (recommended):**
 
 ```yaml
+general:
+  front_end:
+    relay_enabled: true   # Enable WebSocket relay; Robot connects to ws://host:port/ws/robot
+
 functions:
   explain_scene:
     _type: explain_scene
-    camera_index: 0
-    llm_name: main_llm                      # Reuse main_llm's base_url and api_key
-    vlm_model: "google/gemma-4-31b-it"      # Multimodal vision model
+    llm_name: main_llm
+    vlm_model: "google/gemma-4-31b-it"
 ```
 
-Standalone configuration (without LLM reference) is also supported:
+On the Robot side:
+
+```bash
+python client/camera_server.py --relay ws://NAT_SERVER_IP:8000/ws/robot
+```
+
+See the "Robot Camera Relay" section above for full details.
+
+**Mode 2 — Remote HTTP (direct connection):**
+
+```yaml
+functions:
+  explain_scene:
+    _type: explain_scene
+    remote_camera_url: "http://ROBOT_IP:9903"
+    llm_name: main_llm
+    vlm_model: "google/gemma-4-31b-it"
+```
+
+**Mode 3 — Local USB webcam:**
 
 ```yaml
 functions:
   explain_scene:
     _type: explain_scene
     camera_index: 0
-    vlm_base_url: "https://integrate.api.nvidia.com/v1"
-    vlm_api_key: "nvapi-YOUR_KEY"
+    llm_name: main_llm
     vlm_model: "google/gemma-4-31b-it"
 ```
 
@@ -424,31 +523,34 @@ functions:
 ```
 nat-xiaozhi-voice-agent/
 ├── configs/
-│   └── xiaozhi_voice.yml          # Unified NAT config
+│   └── xiaozhi_voice.yml          # Unified NAT config (incl. relay_enabled)
+├── client/                         # Robot / desktop client scripts
+│   ├── camera_server.py            # Robot camera server (relay / HTTP / MCP modes)
+│   └── py-xiaozhi-ws.py            # Desktop test client (push-to-talk)
 ├── models/                         # Model files (download required)
 │   ├── snakers4_silero-vad/        # Silero VAD ONNX model
 │   └── SenseVoiceSmall/            # FunASR speech recognition model
 ├── src/nat_xiaozhi_voice/
 │   ├── frontend/                   # NAT front-end plugin (WebSocket server)
-│   │   ├── config.py               # Pydantic config definition
+│   │   ├── config.py               # Pydantic config definition (incl. relay_enabled)
 │   │   ├── connection.py           # Per-connection handler (VAD→ASR→LLM→TTS)
 │   │   ├── plugin.py               # NAT FrontEndBase implementation
 │   │   ├── register.py             # NAT front-end registration
-│   │   └── ws_server.py            # FastAPI WebSocket server
+│   │   └── ws_server.py            # FastAPI WebSocket server + Robot Camera Relay
 │   ├── pipeline/                   # Voice pipeline components
 │   │   ├── asr.py                  # FunASR speech recognition
 │   │   ├── tts.py                  # Edge TTS / CosyVoice synthesis
 │   │   └── vad.py                  # Silero VAD voice activity detection
 │   ├── tools/                      # Custom NAT tools
 │   │   ├── register.py             # explain_scene registration (llm_name reference)
-│   │   └── vlm_camera.py           # VLM camera tool
+│   │   └── vlm_camera.py           # VLM camera tool (relay / HTTP / local)
 │   ├── utils/
 │   │   ├── audio_codec.py          # Opus encode/decode
 │   │   ├── audio_rate_controller.py # Audio rate control
 │   │   └── auth.py                 # JWT authentication
 │   └── workflow/
 │       └── register.py             # LangGraph Agent definition (with memory compression)
-├── py-xiaozhi-ws.py                # Desktop test client (push-to-talk)
+├── mcp_ws_relay.py                 # Standalone relay (backup, not needed with relay_enabled)
 ├── test_vlm.py                     # VLM vision model test script
 ├── Dockerfile                      # Docker container definition
 ├── docker-compose.yml              # One-command launch config
