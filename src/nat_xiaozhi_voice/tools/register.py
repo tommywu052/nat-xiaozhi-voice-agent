@@ -1,28 +1,23 @@
 """Register the ``explain_scene`` VLM camera tool with NAT.
 
-YAML usage (unified with main LLM)::
+Supports three camera sources:
+
+* **Local camera** — captures from USB webcam on the NAT server.
+* **Remote camera (HTTP)** — fetches image from a Robot camera server via HTTP.
+* **Relay (built-in)** — Robot connects via WebSocket to NAT's ``/ws/robot``,
+  no fixed Robot IP required.  Set ``relay_enabled: true`` in front-end config.
+
+YAML usage (relay — recommended for dynamic Robot IP)::
+
+    general:
+      front_end:
+        relay_enabled: true   # Robot connects to ws://host:port/ws/robot
 
     functions:
       explain_scene:
         _type: explain_scene
-        camera_index: 0
-        llm_name: main_llm                            # reuse LLM provider
-        vlm_model: "nvidia/llama-3.2-nv-vision-instruct-11b"  # multimodal model
-
-YAML usage (standalone)::
-
-    functions:
-      explain_scene:
-        _type: explain_scene
-        camera_index: 0
-        vlm_api_key: "sk-..."
-        vlm_base_url: "https://integrate.api.nvidia.com/v1"
-        vlm_model: "nvidia/llama-3.2-nv-vision-instruct-11b"
-
-    functions:
-      voice_agent:
-        tool_names:
-          - explain_scene
+        llm_name: main_llm
+        vlm_model: "google/gemma-4-31b-it"
 """
 
 from __future__ import annotations
@@ -45,7 +40,15 @@ logger = logging.getLogger(__name__)
 class ExplainSceneConfig(FunctionBaseConfig, name="explain_scene"):
     """VLM camera tool — captures a frame and describes the scene."""
 
-    camera_index: int = Field(default=0, description="USB camera device index")
+    camera_index: int = Field(default=0, description="USB camera device index (local camera only)")
+    remote_camera_url: str = Field(
+        default="",
+        description=(
+            "URL of the remote Robot camera server (e.g. 'http://192.168.1.100:9903'). "
+            "When set, images are fetched from the remote server instead of the local camera. "
+            "The robot should run camera_server.py with --port matching this URL."
+        ),
+    )
     llm_name: Optional[LLMRef] = Field(
         default=None,
         description="Reference a configured LLM (e.g. 'main_llm') to reuse its base_url and api_key",
@@ -57,7 +60,7 @@ class ExplainSceneConfig(FunctionBaseConfig, name="explain_scene"):
         description="Vision-language model name (overrides the LLM's model_name)",
     )
     default_prompt: str = Field(
-        default="用繁體中文描述畫面，20字以內",
+        default="用繁體中文列出畫面中所有物品和人。每項一行，包含位置(左/中/右/前/後)、顏色、大小或形狀。只列清單，不要寫開頭總結。",
         description="Default VLM prompt when no specific query is given",
     )
 
@@ -76,6 +79,21 @@ def _resolve_llm_config(builder: Builder, llm_name: str) -> tuple[str, str]:
     return base_url, api_key
 
 
+def _is_relay_enabled(builder: Builder) -> bool:
+    """Check if relay_enabled is set in the front-end config."""
+    try:
+        wb = getattr(builder, "_workflow_builder", builder)
+        gc = getattr(wb, "general_config", None)
+        if gc is None:
+            return False
+        fe_cfg = getattr(gc, "front_end", None)
+        if fe_cfg is None:
+            return False
+        return bool(getattr(fe_cfg, "relay_enabled", False))
+    except Exception:
+        return False
+
+
 @register_function(config_type=ExplainSceneConfig)
 async def explain_scene_tool(config: ExplainSceneConfig, builder: Builder):
     from nat_xiaozhi_voice.tools import vlm_camera
@@ -87,12 +105,16 @@ async def explain_scene_tool(config: ExplainSceneConfig, builder: Builder):
         base_url = config.vlm_base_url
         api_key = config.vlm_api_key
 
+    use_relay = _is_relay_enabled(builder)
+
     vlm_camera.configure(
         camera_index=config.camera_index,
         vlm_api_key=api_key,
         vlm_base_url=base_url,
         vlm_model=config.vlm_model,
         default_prompt=config.default_prompt,
+        remote_camera_url=config.remote_camera_url,
+        use_relay=use_relay,
     )
 
     async def _explain_scene(query: str = "") -> str:
@@ -104,10 +126,21 @@ async def explain_scene_tool(config: ExplainSceneConfig, builder: Builder):
         """
         return await vlm_camera.analyze_scene(query)
 
-    logger.info(
-        "explain_scene tool registered (camera=%d, model=%s)",
-        config.camera_index, config.vlm_model,
-    )
+    if use_relay:
+        logger.info(
+            "explain_scene tool registered (RELAY built-in, vlm_model=%s)",
+            config.vlm_model,
+        )
+    elif config.remote_camera_url:
+        logger.info(
+            "explain_scene tool registered (REMOTE=%s, vlm_model=%s)",
+            config.remote_camera_url, config.vlm_model,
+        )
+    else:
+        logger.info(
+            "explain_scene tool registered (LOCAL camera=%d, vlm_model=%s)",
+            config.camera_index, config.vlm_model,
+        )
 
     try:
         yield FunctionInfo.from_fn(

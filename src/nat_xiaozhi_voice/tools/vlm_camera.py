@@ -1,8 +1,13 @@
 """USB webcam capture + VLM scene description.
 
-Manages a persistent cv2.VideoCapture and provides an async-safe
-``analyze_scene`` function that captures a frame, encodes it to JPEG
-base64, and sends it to a vision-language model for description.
+Supports two camera sources:
+
+* **Local camera** — uses ``cv2.VideoCapture`` on the NAT server.
+* **Remote camera** — fetches a base64 JPEG from a remote Robot camera
+  server via HTTP (e.g. ``camera_server.py`` running on the robot).
+
+In both cases, the captured image is sent to a vision-language model
+(VLM) running on the NAT server for scene description.
 
 Thread safety: all OpenCV calls are serialised through an asyncio Lock
 and run in the default executor so the event loop is never blocked.
@@ -27,7 +32,10 @@ _camera_lock = asyncio.Lock()
 
 _vlm_client: Optional[openai.AsyncOpenAI] = None
 _vlm_model: str = "meta/llama-3.2-11b-vision-instruct"
-_default_prompt: str = "用繁體中文描述畫面，20字以內"
+_default_prompt: str = "用繁體中文列出畫面中所有物品和人。每項一行，包含位置(左/中/右/前/後)、顏色、大小或形狀。只列清單，不要寫開頭總結。"
+
+_remote_camera_url: str = ""
+_use_relay: bool = False
 
 
 def configure(
@@ -36,28 +44,51 @@ def configure(
     vlm_api_key: str = "",
     vlm_base_url: str = "",
     vlm_model: str = "meta/llama-3.2-11b-vision-instruct",
-    default_prompt: str = "用繁體中文描述畫面，20字以內",
+    default_prompt: str = "用繁體中文列出畫面中所有物品和人。每項一行，包含位置(左/中/右/前/後)、顏色、大小或形狀。只列清單，不要寫開頭總結。",
+    remote_camera_url: str = "",
+    use_relay: bool = False,
 ) -> None:
-    """Call once at startup to configure camera and VLM client."""
-    global _camera_index, _vlm_client, _vlm_model, _default_prompt
+    """Call once at startup to configure camera and VLM client.
+
+    Parameters
+    ----------
+    remote_camera_url : str, optional
+        URL of the remote Robot camera server (e.g. ``http://192.168.1.100:9903``).
+        When set, the tool fetches images from the remote server instead of
+        the local USB camera.  The ``/capture`` endpoint is appended automatically.
+    use_relay : bool, optional
+        When True, use the built-in WebSocket relay (robot_relay) instead of
+        HTTP fetch.  Requires ``relay_enabled: true`` in front-end config.
+    """
+    global _camera_index, _vlm_client, _vlm_model, _default_prompt, _remote_camera_url, _use_relay
 
     _camera_index = camera_index
     _vlm_model = vlm_model
     _default_prompt = default_prompt
+    _remote_camera_url = remote_camera_url.rstrip("/") if remote_camera_url else ""
+    _use_relay = use_relay
 
     kwargs: dict = {"api_key": vlm_api_key}
     if vlm_base_url:
         kwargs["base_url"] = vlm_base_url
     _vlm_client = openai.AsyncOpenAI(**kwargs)
 
-    logger.info(
-        "VLM camera configured: camera=%d model=%s base_url=%s",
-        camera_index, vlm_model, vlm_base_url or "(default)",
-    )
-
-    # Skip pre-warm; camera is opened lazily on first tool call.
-    # This avoids startup errors when no camera is attached.
-    logger.info("Camera will be opened lazily on first tool call")
+    if _use_relay:
+        logger.info(
+            "VLM camera configured: RELAY (built-in WebSocket) model=%s base_url=%s",
+            vlm_model, vlm_base_url or "(default)",
+        )
+    elif _remote_camera_url:
+        logger.info(
+            "VLM camera configured: REMOTE=%s model=%s base_url=%s",
+            _remote_camera_url, vlm_model, vlm_base_url or "(default)",
+        )
+    else:
+        logger.info(
+            "VLM camera configured: LOCAL camera=%d model=%s base_url=%s",
+            camera_index, vlm_model, vlm_base_url or "(default)",
+        )
+        logger.info("Camera will be opened lazily on first tool call")
 
 
 def _ensure_camera() -> cv2.VideoCapture:
@@ -87,8 +118,70 @@ def _capture_b64() -> str:
     return base64.b64encode(buf).decode("utf-8")
 
 
+async def _fetch_remote_image() -> str:
+    """Fetch a base64 JPEG image from the remote Robot camera server."""
+    import aiohttp
+
+    url = f"{_remote_camera_url}/capture"
+    logger.info("Fetching remote camera image from %s", url)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"Remote camera returned HTTP {resp.status}")
+                data = await resp.json()
+
+        if not data.get("success"):
+            error_msg = data.get("error", "Unknown remote camera error")
+            raise RuntimeError(f"Remote camera error: {error_msg}")
+
+        b64 = data["image_b64"]
+        logger.info("Remote camera returned %d bytes base64", len(b64))
+        return b64
+
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            f"Remote camera server ({_remote_camera_url}) timed out — "
+            "camera may not be connected on the robot"
+        )
+    except aiohttp.ClientError as exc:
+        raise RuntimeError(f"Cannot reach remote camera server ({_remote_camera_url}): {exc}") from exc
+
+
+async def _fetch_relay_image() -> str:
+    """Fetch a base64 JPEG image via the built-in WebSocket relay."""
+    from nat_xiaozhi_voice.frontend.ws_server import robot_relay
+
+    logger.info("Fetching camera image via built-in relay")
+    result = await robot_relay.capture(camera_index=0)
+
+    if not result.get("success"):
+        error_msg = result.get("error", "Unknown relay error")
+        raise RuntimeError(f"Relay camera error: {error_msg}")
+
+    b64 = result.get("image_b64", "")
+    logger.info("Relay camera returned %d bytes base64", len(b64))
+    return b64
+
+
+async def _get_image_b64() -> str:
+    """Get a base64 image from local camera, remote HTTP, or built-in relay."""
+    if _use_relay:
+        return await _fetch_relay_image()
+    elif _remote_camera_url:
+        return await _fetch_remote_image()
+    else:
+        loop = asyncio.get_running_loop()
+        async with _camera_lock:
+            return await loop.run_in_executor(None, _capture_b64)
+
+
 async def analyze_scene(query: str = "") -> str:
     """Capture a frame and ask the VLM to describe it.
+
+    Automatically chooses local or remote camera based on configuration.
+    VLM analysis always runs on the NAT server side.
 
     Parameters
     ----------
@@ -107,38 +200,55 @@ async def analyze_scene(query: str = "") -> str:
     t0 = time.time()
 
     try:
-        loop = asyncio.get_running_loop()
-        async with _camera_lock:
-            b64_image = await loop.run_in_executor(None, _capture_b64)
+        b64_image = await _get_image_b64()
     except RuntimeError as exc:
         logger.warning("Camera capture failed: %s", exc)
+        if _remote_camera_url:
+            return f"無法連線遠端攝影機（{_remote_camera_url}）：{exc}"
         return f"無法開啟攝影機：{exc}。目前沒有可用的攝影機裝置。"
 
     t_cap = time.time()
-    logger.info("Camera capture took %.2fs", t_cap - t0)
+    source = "relay" if _use_relay else ("remote" if _remote_camera_url else "local")
+    logger.info("Camera capture (%s) took %.2fs", source, t_cap - t0)
 
     prompt_text = query.strip() if query.strip() else _default_prompt
 
     try:
-        response = await _vlm_client.chat.completions.create(
-            model=_vlm_model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt_text},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}},
-                    ],
-                }
-            ],
-            max_tokens=256,
+        response = await asyncio.wait_for(
+            _vlm_client.chat.completions.create(
+                model=_vlm_model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt_text},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}},
+                        ],
+                    }
+                ],
+                max_tokens=150,
+            ),
+            timeout=15.0,
         )
+    except asyncio.TimeoutError:
+        elapsed = time.time() - t_cap
+        logger.warning("VLM API timed out after %.1fs", elapsed)
+        return "攝影機有拍到畫面，但視覺分析超時了，請稍後再試。"
     except Exception as exc:
         logger.warning("VLM API call failed: %s", exc)
         return f"攝影機已擷取畫面，但 VLM 分析失敗：{exc}"
 
-    result = response.choices[0].message.content or ""
-    logger.info("VLM analysis took %.2fs, result=%d chars", time.time() - t_cap, len(result))
+    msg = response.choices[0].message
+    result = msg.content or ""
+    if not result:
+        logger.warning(
+            "VLM returned empty content. finish_reason=%s, refusal=%s, role=%s, raw=%s",
+            response.choices[0].finish_reason,
+            getattr(msg, "refusal", None),
+            msg.role,
+            str(msg)[:500],
+        )
+    logger.info("VLM analysis (%s camera) took %.2fs, result=%d chars", source, time.time() - t_cap, len(result))
     return result
 
 

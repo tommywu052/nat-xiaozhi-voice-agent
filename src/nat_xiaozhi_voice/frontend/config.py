@@ -43,5 +43,11 @@ class XiaozhiVoiceFrontEndConfig(FrontEndBaseConfig, name="xiaozhi_voice"):
     # Workflow function name to invoke (must match a key in ``functions:`` section)
     workflow_function: str = Field(default="voice_agent")
 
+    # Robot camera relay — accept WebSocket from Robot on /ws/robot
+    relay_enabled: bool = Field(
+        default=False,
+        description="Enable WebSocket relay for robot camera. Robot connects to ws://host:port/ws/robot",
+    )
+
     # CORS (for potential HTTP endpoints alongside WS)
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])

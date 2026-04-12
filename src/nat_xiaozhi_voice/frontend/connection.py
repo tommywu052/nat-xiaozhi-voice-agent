@@ -335,6 +335,7 @@ class ConnectionHandler:
                             t_first_token - t_start,
                         )
                     full_reply_parts.append(chunk)
+                    await self._send_json({"type": "llm", "delta": chunk, "session_id": self.session_id})
                     text_buf.append(chunk)
 
                     buffered = "".join(text_buf)
@@ -409,6 +410,8 @@ class ConnectionHandler:
             logger.exception("Streaming pipeline error")
 
         reply = "".join(full_reply_parts)
+        if not self._abort_requested:
+            await self._send_json({"type": "llm", "text": reply, "session_id": self.session_id})
         elapsed = time.time() - t_start
         logger.info(
             "Agent reply (%d chars, %.2fs total): %s",
@@ -442,6 +445,9 @@ class ConnectionHandler:
             reply = "抱歉，我遇到了一點問題。"
 
         logger.info("Agent reply (%d chars): %s", len(reply) if reply else 0, (reply or "")[:120])
+
+        if reply:
+            await self._send_json({"type": "llm", "text": reply, "session_id": self.session_id})
 
         if not reply:
             await self._send_json({"type": "listen", "state": "start", "session_id": self.session_id})

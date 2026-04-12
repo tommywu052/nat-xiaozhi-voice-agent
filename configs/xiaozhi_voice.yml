@@ -2,12 +2,11 @@
 # Xiaozhi Voice Agent — unified NAT configuration
 #
 # 啟動方式：
-#   cd /home/tommwu/nemotron/NeMo-Agent-Toolkit
-#   pip install -e .
 #   nat start xiaozhi_voice --config_file configs/xiaozhi_voice.yml
 #
 # 客戶端連接：
-#   ws://localhost:8000/xiaozhi/v1/
+#   Voice WS:   ws://localhost:8000/xiaozhi/v1/
+#   Robot cam:   ws://localhost:8000/ws/robot  (when relay_enabled: true)
 #
 # 觀測：
 #   Phoenix dashboard: http://localhost:6006
@@ -45,6 +44,10 @@ general:
     close_no_voice_seconds: 120
     workflow_function: voice_agent
 
+    # Robot camera relay — Robot connects via WebSocket, no fixed IP needed
+    # Robot 端啟動: python camera_server.py --relay ws://NAT_IP:8000/ws/robot
+    relay_enabled: true
+
     cors_origins:
       - "*"
 
@@ -61,9 +64,9 @@ general:
 llms:
   main_llm:
     _type: openai
-    base_url: "https://integrate.api.nvidia.com/v1"
-    model_name: "qwen/qwen3-next-80b-a3b-instruct"
-    api_key: "${NVIDIA_API_KEY}"
+    base_url: "http://localhost:8880/v1"
+    model_name: "bg-digitalservices/Gemma-4-E2B-it-NVFP4"
+    api_key: "not-needed"
     temperature: 0.3
 
 # -----------------------------------------------------------------------------
@@ -87,8 +90,15 @@ functions:
   explain_scene:
     _type: explain_scene
     camera_index: 0
-    llm_name: main_llm
-    vlm_model: "google/gemma-4-31b-it"
+    # Camera source priority:
+    #   1. relay_enabled: true in front_end → uses built-in WebSocket relay (recommended)
+    #   2. remote_camera_url set → HTTP direct to Robot camera server
+    #   3. Neither → local USB camera on NAT server
+    # remote_camera_url: "http://172.29.107.223:9903"  # only needed if relay_enabled: false
+    vlm_api_key: "not-needed"
+    vlm_base_url: "http://localhost:8880/v1"
+    vlm_model: "bg-digitalservices/Gemma-4-E2B-it-NVFP4"
+    default_prompt: "用繁體中文列出畫面中所有物品和人。每項一行，包含位置(左/中/右/前/後)、顏色、大小或形狀。只列清單，不要寫開頭總結。"
 
   # get_weather and get_lunar require custom NAT function registration (Phase 2)
   # get_weather:
@@ -121,6 +131,14 @@ functions:
       - 用一兩句口語化的話回答，像在跟朋友聊天。
       - 即使工具回傳大量資料，也只摘要最關鍵的一兩點。
 
+      【工具回覆 — 必須精簡】
+      當你呼叫工具（current_datetime、web_search、explain_scene、wiki_search）後收到結果時，你的回覆必須在40字以內，只講最核心的一句話：
+      - 時間日期：「現在下午三點十五分」就好。
+      - 天氣：「台北今天多雲，23到33度」就好。
+      - 看畫面：「前面是實驗室，有架子和設備」就好。
+      - 搜尋結果：只講最關鍵的一個事實。
+      絕對不要展開描述、不要列清單、不要補充說明。
+
       【什麼時候不要使用工具 — 非常重要】
       以下情況絕對不要呼叫任何工具，直接用你自己的知識回答：
       - 打招呼、問好（你好、嗨、hello）
@@ -137,12 +155,13 @@ functions:
       - 問天氣、新聞等即時資訊 → 必須呼叫 web_search。
 
       【工具使用規則】
-      - 每輪對話最多使用一個工具，一次就好。
+      - 每一輪回覆只呼叫一個工具。但不同輪可以重複使用同一工具，工具沒有全局次數限制。
+      - 使用者每次說「看一下」「再看」都要重新呼叫 explain_scene，不要說工具不能用。
       - 如果工具回傳錯誤或「無法開啟」，直接告訴使用者該功能暫不可用，不要重試或換工具。
       - current_datetime：問時間或日期時必須呼叫，每次都要重新呼叫，不要用之前的結果。
       - wiki_search：使用者要求查維基百科或問人物、事件的詳細資料時使用。
       - web_search：使用者明確要求搜尋新聞、最新資訊、即時消息時使用。
-      - explain_scene：只在使用者明確說「看一下」「你看到什麼」「拍照」時使用。
+      - explain_scene：使用者說「看一下」「你看到什麼」「拍照」「再看」、「描述一下」、「檢查一下環境」、「看看周圍」、「檢查一下」、「確認一下」、「前面有什麼」或類似需要視覺檢查 時必須呼叫。
     max_iterations: 3
     verbose: true
 

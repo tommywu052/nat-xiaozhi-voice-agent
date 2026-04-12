@@ -2,6 +2,7 @@
 
 Hosts a FastAPI application with:
 - ``/xiaozhi/v1/``                — binary WebSocket for ESP32 / py-xiaozhi clients
+- ``/ws/robot``                   — WebSocket relay for Robot camera (when relay_enabled)
 - ``/health``                     — simple health-check
 - ``/api/memory/{device_id}``     — DELETE to clear per-device memory
 - ``/api/memory``                 — DELETE to clear all memory
@@ -11,10 +12,12 @@ Hosts a FastAPI application with:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import uuid
 from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
@@ -29,6 +32,75 @@ if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+# ── Robot Camera Relay (singleton, shared across the process) ────────────
+
+class RobotCameraRelay:
+    """WebSocket relay bridge: Robot connects in, NAT captures via internal call.
+
+    This lives as a module-level singleton so that both the FastAPI routes
+    (in ws_server.py) and vlm_camera.py can access it without circular imports.
+    """
+
+    def __init__(self):
+        self._robot_ws: Optional[WebSocket] = None
+        self._lock = asyncio.Lock()
+        self._pending: dict[str, asyncio.Future] = {}
+
+    @property
+    def robot_connected(self) -> bool:
+        return self._robot_ws is not None
+
+    async def set_robot(self, ws: Optional[WebSocket]):
+        async with self._lock:
+            if self._robot_ws is not None and ws is not self._robot_ws:
+                try:
+                    await self._robot_ws.close(1000, "replaced")
+                except Exception:
+                    pass
+            self._robot_ws = ws
+
+    async def remove_robot(self, ws: WebSocket):
+        async with self._lock:
+            if self._robot_ws is ws:
+                self._robot_ws = None
+        for rid, fut in list(self._pending.items()):
+            if not fut.done():
+                fut.set_exception(RuntimeError("Robot disconnected"))
+            self._pending.pop(rid, None)
+
+    def resolve(self, request_id: str, data: dict):
+        fut = self._pending.get(request_id)
+        if fut and not fut.done():
+            fut.set_result(data)
+
+    async def capture(self, camera_index: int = 0, timeout: float = 15.0) -> dict:
+        """Send a capture request to the Robot and wait for the response."""
+        if self._robot_ws is None:
+            return {"success": False, "error": "No robot connected — waiting for robot to connect via WebSocket"}
+
+        request_id = str(uuid.uuid4())
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[request_id] = future
+
+        try:
+            await self._robot_ws.send_json({
+                "request_id": request_id,
+                "type": "capture",
+                "camera_index": camera_index,
+            })
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "Robot did not respond within timeout"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+        finally:
+            self._pending.pop(request_id, None)
+
+
+# Module-level singleton — importable by vlm_camera.py
+robot_relay = RobotCameraRelay()
 
 
 class XiaozhiWSServer:
@@ -91,6 +163,19 @@ class XiaozhiWSServer:
         app.add_api_route("/api/memory", self._clear_all_memory, methods=["DELETE"])
         app.add_api_route("/api/memory/{device_id:path}", self._clear_device_memory, methods=["DELETE"])
 
+        # Proxy-friendly routes (no /api/ prefix) for NAT UI access
+        app.add_api_route("/memory", self._list_memory, methods=["GET"])
+        app.add_api_route("/memory", self._clear_all_memory, methods=["DELETE"])
+        app.add_api_route("/memory/{device_id:path}", self._clear_device_memory, methods=["DELETE"])
+        app.add_api_route("/history/{device_id:path}", self._get_history, methods=["GET"])
+        app.add_api_route("/connections", self._get_connections, methods=["GET"])
+
+        # Robot camera relay (when enabled)
+        if self._cfg.relay_enabled:
+            app.add_api_websocket_route("/ws/robot", self._robot_ws_endpoint)
+            app.add_api_route("/relay/capture", self._relay_capture, methods=["GET"])
+            logger.info("Robot camera relay enabled — Robot connects to ws://host:%d/ws/robot", self._cfg.port)
+
         ws_path = self._cfg.ws_path.rstrip("/") + "/"
         app.add_api_websocket_route(ws_path, self._ws_endpoint)
         ws_path_no_slash = ws_path.rstrip("/")
@@ -139,7 +224,7 @@ class XiaozhiWSServer:
     # ── routes ─────────────────────────────────────────────────────────
 
     async def _health(self):
-        return {
+        result = {
             "status": "ok",
             "connections": len(self._connections),
             "pipeline": {
@@ -148,6 +233,9 @@ class XiaozhiWSServer:
                 "tts": self._tts is not None,
             },
         }
+        if self._cfg.relay_enabled:
+            result["robot_connected"] = robot_relay.robot_connected
+        return result
 
     async def _list_memory(self):
         """GET /api/memory — list devices that have stored memory."""
@@ -183,6 +271,64 @@ class XiaozhiWSServer:
         except Exception:
             logger.exception("Failed to clear all memory")
             return {"error": "Internal error"}
+
+    async def _get_history(self, device_id: str):
+        """GET /history/{device_id} — retrieve conversation history from LangGraph."""
+        from nat_xiaozhi_voice.workflow.register import _shared_agent_state
+
+        agent = _shared_agent_state.get("agent")
+        if not agent:
+            return {"device_id": device_id, "messages": [], "count": 0, "error": "Agent not initialized"}
+
+        try:
+            from langchain_core.messages import AIMessage, HumanMessage
+
+            state = await agent.aget_state({"configurable": {"thread_id": device_id}})
+            if not state or not state.values:
+                return {"device_id": device_id, "messages": [], "count": 0}
+
+            messages = state.values.get("messages", [])
+            result = []
+            for m in messages:
+                content = getattr(m, "content", "")
+                if isinstance(content, list):
+                    parts = [p.get("text", "") if isinstance(p, dict) else str(p) for p in content]
+                    content = "".join(parts)
+                else:
+                    content = str(content)
+
+                if not content.strip():
+                    continue
+
+                if isinstance(m, HumanMessage):
+                    role = "user"
+                elif isinstance(m, AIMessage):
+                    if getattr(m, "tool_calls", None):
+                        continue
+                    role = "assistant"
+                else:
+                    continue
+
+                result.append({"role": role, "content": content})
+
+            return {"device_id": device_id, "messages": result, "count": len(result)}
+        except Exception:
+            logger.exception("Failed to get history for device=%s", device_id)
+            return {"device_id": device_id, "messages": [], "count": 0}
+
+    async def _get_connections(self):
+        """GET /connections — list currently active WebSocket connections."""
+        return {
+            "connections": [
+                {
+                    "device_id": h.device_id,
+                    "client_id": h.client_id,
+                    "session_id": h.session_id,
+                }
+                for h in self._connections.values()
+            ],
+            "count": len(self._connections),
+        }
 
     async def _ws_endpoint(self, ws: WebSocket):
         # Extract device headers (from query params or headers)
@@ -231,3 +377,32 @@ class XiaozhiWSServer:
             await handler.run()
         finally:
             self._connections.pop(handler.session_id, None)
+
+    # ── Robot camera relay endpoints ──────────────────────────────────
+
+    async def _robot_ws_endpoint(self, ws: WebSocket):
+        """Accept a WebSocket connection from the Robot camera."""
+        await ws.accept()
+        remote = ws.client
+        logger.info("Robot camera connected from %s:%s",
+                     remote.host if remote else "?", remote.port if remote else "?")
+
+        await robot_relay.set_robot(ws)
+        try:
+            while True:
+                data = await ws.receive_json()
+                request_id = data.get("request_id", "")
+                if request_id:
+                    robot_relay.resolve(request_id, data)
+                else:
+                    logger.warning("Robot sent message without request_id: %s", str(data)[:200])
+        except WebSocketDisconnect:
+            logger.info("Robot camera disconnected")
+        except Exception as e:
+            logger.error("Robot camera WebSocket error: %s", e)
+        finally:
+            await robot_relay.remove_robot(ws)
+
+    async def _relay_capture(self, index: int = Query(0, description="Camera device index")):
+        """HTTP endpoint for internal relay capture (used by vlm_camera)."""
+        return await robot_relay.capture(camera_index=index)

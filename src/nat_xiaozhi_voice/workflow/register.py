@@ -172,7 +172,27 @@ async def voice_agent_workflow(config: VoiceAgentWorkflowConfig, builder: Builde
             sys = SystemMessage(content=config.system_prompt)
             messages_for_llm = [sys] + list(messages)
 
-        return {"messages": [await llm_with_tools.ainvoke(messages_for_llm)]}
+        response = await llm_with_tools.ainvoke(messages_for_llm)
+
+        # Filter phantom tool calls: rebuild AIMessage without empty-name calls
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            valid_calls = [tc for tc in response.tool_calls if tc.get("name")]
+            phantom_count = len(response.tool_calls) - len(valid_calls)
+            if phantom_count > 0:
+                logger.warning("Filtered %d phantom tool call(s)", phantom_count)
+                ak = dict(response.additional_kwargs) if hasattr(response, "additional_kwargs") else {}
+                if "tool_calls" in ak:
+                    ak["tool_calls"] = [
+                        tc for tc in ak["tool_calls"]
+                        if tc.get("function", {}).get("name")
+                    ]
+                response = AIMessage(
+                    content=response.content or "",
+                    tool_calls=valid_calls,
+                    additional_kwargs=ak,
+                )
+
+        return {"messages": [response]}
 
     # ── Build graph ──────────────────────────────────────────────
     graph = StateGraph(AgentState)
