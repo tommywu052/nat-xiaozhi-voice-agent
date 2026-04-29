@@ -41,9 +41,12 @@ if typing.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_SYSTEM_PROMPT = (
-    "你是小智，來自台灣的 AI 語音助手。全程使用繁體中文回覆，禁止簡體字。"
-    "說話簡短精準，適合語音場景。"
-    "禁止自行猜測即時資訊，問日期時間必須呼叫 current_datetime 工具。"
+    "You are Xiaozhi (小智), a Taiwanese female voice assistant. "
+    "ALWAYS reply in Traditional Chinese (繁體中文). NEVER use Simplified Chinese or English. "
+    "Keep replies SHORT: 1-2 sentences, under 30 words. This is a VOICE assistant. "
+    "NO markdown, NO lists, NO emoji. Give direct answers. "
+    "For date/time questions, ALWAYS call current_datetime tool. "
+    "For weather/news/recommendations, ALWAYS call web_search tool."
 )
 
 MEMORY_DB_PATH = os.environ.get("XIAOZHI_MEMORY_DB", "xiaozhi_memory.db")
@@ -85,7 +88,7 @@ async def voice_agent_workflow(config: VoiceAgentWorkflowConfig, builder: Builde
     # max_tokens caps reply length for voice-friendly output (~60 Chinese chars).
     # extra_body must be passed inside bind_tools to survive the RunnableBinding chain.
     _NO_THINKING = {"chat_template_kwargs": {"enable_thinking": False}}
-    _LLM_KWARGS = {"extra_body": _NO_THINKING, "max_tokens": 200}
+    _LLM_KWARGS = {"extra_body": _NO_THINKING, "max_tokens": 150}
     if tools:
         llm_with_tools = llm.bind_tools(
             tools, parallel_tool_calls=False, **_LLM_KWARGS

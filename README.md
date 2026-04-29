@@ -12,7 +12,8 @@
 
 | 日期 | 版本 | 變更摘要 |
 |------|------|---------|
-| 2026-04-29 | **v3 — Nemotron-3-Nano-Omni** | 前端 LLM+VLM 統一為 [Nemotron-3-Nano-Omni](https://blogs.nvidia.com/blog/nemotron-3-nano-omni-multimodal-ai-agents/) 30B-A3B MoE (NVFP4)。關閉 reasoning 模式，First Token 從 10-14s 降至 0.2-0.6s。OpenClaw 後端 LLM 同步換為 Nano Omni (vLLM)。新增 60 字硬性回覆截斷、TTS markdown 清理、Tavily web_search 強化路由。 |
+| 2026-04-30 | **v3.1 — Prompt 優化** | System prompt 改為英文（Nano Omni 對英文指令遵從性更佳），移除前端 60 字硬截斷改由 LLM 自然控制回覆長度。OpenClaw 非同步回呼注入 `_VOICE_SUFFIX` 英文提示，從源頭限制輸出（1232→57 chars），TTS 從 49s 降至 14s。 |
+| 2026-04-29 | **v3 — Nemotron-3-Nano-Omni** | 前端 LLM+VLM 統一為 [Nemotron-3-Nano-Omni](https://blogs.nvidia.com/blog/nemotron-3-nano-omni-multimodal-ai-agents/) 30B-A3B MoE (NVFP4)。關閉 reasoning 模式，First Token 從 10-14s 降至 0.2-0.6s。OpenClaw 後端 LLM 同步換為 Nano Omni (vLLM)。TTS markdown 清理、Tavily web_search 強化路由。 |
 | 2026-04-28 | v2 — Gemma4 E2B + OpenClaw | 前端 LLM 換為 Gemma4 E2B (2B)，新增 OpenClaw 雙 LLM 架構、非同步回呼、Robot Camera Relay。 |
 | 2026-04-27 | v1 — Nemotron 3 Super | 初版。前端 LLM 使用 Nemotron 3 Super (Ollama)，基本語音管線 + Tool Calling。 |
 

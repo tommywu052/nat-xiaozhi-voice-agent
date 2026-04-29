@@ -77,7 +77,16 @@ def should_async(message: str) -> bool:
     return bool(_ASYNC_KEYWORDS.search(message))
 
 
-def _build_cmd(message: str, timeout: int, *, fresh_session: bool = False) -> str:
+_VOICE_SUFFIX = (
+    "\n\n[IMPORTANT: The result will be read aloud via TTS voice. "
+    "Keep your final answer SHORT — 2-3 sentences max, under 60 Chinese characters. "
+    "No markdown, no bullet lists, no numbering. Plain text only.]"
+)
+
+
+def _build_cmd(message: str, timeout: int, *, fresh_session: bool = False, voice_brief: bool = False) -> str:
+    if voice_brief:
+        message = message + _VOICE_SUFFIX
     safe_msg = shlex.quote(message)
     if fresh_session:
         import uuid
@@ -97,8 +106,8 @@ def _clean_output(raw: str) -> str:
     return "\n".join(cleaned).strip()
 
 
-def _summarize(text: str, max_chars: int = 300) -> str:
-    """Trim to a voice-friendly length for TTS."""
+def _summarize(text: str, max_chars: int = 120) -> str:
+    """Fallback trim for TTS — primary length control is via voice_brief prompt."""
     text = re.sub(r"[#*_`\[\]]", "", text)
     text = re.sub(r"\n{2,}", "。", text)
     text = text.replace("\n", "，").strip()
@@ -107,7 +116,7 @@ def _summarize(text: str, max_chars: int = 300) -> str:
     for sep in ("。", "，", ". ", ", "):
         cut = text[:max_chars].rfind(sep)
         if cut > max_chars // 3:
-            return text[: cut + len(sep)].rstrip("，,") + "。"
+            return text[: cut + len(sep)].rstrip("，,")
     return text[:max_chars] + "……"
 
 
@@ -133,7 +142,7 @@ async def delegate_auto(message: str, device_id: str = "") -> str:
 
 async def delegate_sync(message: str) -> str:
     """Send *message* to OpenClaw and wait for the reply."""
-    cmd = _build_cmd(message, _SYNC_TIMEOUT, fresh_session=True)
+    cmd = _build_cmd(message, _SYNC_TIMEOUT, fresh_session=True, voice_brief=True)
     logger.info("openclaw [sync] sending: %s", message[:80])
 
     try:
@@ -164,7 +173,7 @@ async def delegate_sync(message: str) -> str:
 
 async def delegate_async(message: str, device_id: str = "") -> str:
     """Launch OpenClaw in background; when done, push result via /api/speak."""
-    cmd = _build_cmd(message, _ASYNC_TIMEOUT, fresh_session=True)
+    cmd = _build_cmd(message, _ASYNC_TIMEOUT, fresh_session=True, voice_brief=True)
     logger.info("openclaw [async] launching: %s", message[:80])
 
     async def _background():

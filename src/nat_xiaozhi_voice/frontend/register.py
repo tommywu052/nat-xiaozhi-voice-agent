@@ -83,25 +83,21 @@ async def register_xiaozhi_voice_front_end(
                 result = await runner.result()
             return str(result) if not isinstance(result, str) else result
 
-        MAX_REPLY_CHARS = 60
-
         async def _agent_stream_fn(user_text: str, device_id: str):
             """Async-generator: yields text chunks as the LLM streams tokens.
 
             Uses ``agent.astream()`` instead of ``astream_events`` for
             significantly lower overhead — astream yields graph-state
             updates directly without the heavy event-bus machinery.
-            Truncates reply at MAX_REPLY_CHARS for voice-friendly length.
             """
             _track_user_text(user_text)
             if agent is None:
                 result = await _agent_fn(user_text, device_id)
                 if result:
-                    yield result[:MAX_REPLY_CHARS]
+                    yield result
                 return
 
             cfg = {"configurable": {"thread_id": device_id}}
-            total_chars = 0
             async for chunk in agent.astream(
                 {"messages": [HumanMessage(content=user_text)]},
                 cfg,
@@ -128,17 +124,12 @@ async def register_xiaozhi_voice_front_end(
                     )
                     continue
 
-                # LLM text token — truncate at MAX_REPLY_CHARS
+                # LLM text token
                 content = getattr(msg, "content", None)
                 if isinstance(content, str) and content:
                     langgraph_node = metadata.get("langgraph_node", "")
                     if langgraph_node == "assistant":
-                        remaining = MAX_REPLY_CHARS - total_chars
-                        if remaining <= 0:
-                            continue
-                        chunk_to_yield = content[:remaining]
-                        total_chars += len(chunk_to_yield)
-                        yield chunk_to_yield
+                        yield content
 
         # ── memory management functions ───────────────────────────────
 

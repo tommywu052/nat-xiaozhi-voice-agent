@@ -12,7 +12,8 @@ The original Xiaozhi AI multi-process dual-system architecture has been fully mi
 
 | Date | Version | Summary |
 |------|---------|---------|
-| 2026-04-29 | **v3 — Nemotron-3-Nano-Omni** | Unified frontend LLM+VLM to [Nemotron-3-Nano-Omni](https://blogs.nvidia.com/blog/nemotron-3-nano-omni-multimodal-ai-agents/) 30B-A3B MoE (NVFP4). Disabled reasoning mode, reducing First Token latency from 10-14s to 0.2-0.6s. OpenClaw backend LLM also switched to Nano Omni (vLLM). Added 60-char hard reply truncation, TTS markdown cleanup, and enhanced Tavily web_search routing. |
+| 2026-04-30 | **v3.1 — Prompt Optimization** | System prompt switched to English (Nano Omni has better English instruction following). Removed 60-char hard truncation; LLM now naturally controls reply length. OpenClaw async callback injects `_VOICE_SUFFIX` English prompt to limit output at source (1232→57 chars), TTS reduced from 49s to 14s. |
+| 2026-04-29 | **v3 — Nemotron-3-Nano-Omni** | Unified frontend LLM+VLM to [Nemotron-3-Nano-Omni](https://blogs.nvidia.com/blog/nemotron-3-nano-omni-multimodal-ai-agents/) 30B-A3B MoE (NVFP4). Disabled reasoning mode, reducing First Token latency from 10-14s to 0.2-0.6s. OpenClaw backend LLM also switched to Nano Omni (vLLM). TTS markdown cleanup, enhanced Tavily web_search routing. |
 | 2026-04-28 | v2 — Gemma4 E2B + OpenClaw | Frontend LLM switched to Gemma4 E2B (2B). Added OpenClaw dual-LLM architecture, async callback, Robot Camera Relay. |
 | 2026-04-27 | v1 — Nemotron 3 Super | Initial version. Frontend LLM using Nemotron 3 Super (Ollama), basic voice pipeline + Tool Calling. |
 
