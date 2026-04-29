@@ -62,12 +62,31 @@ general:
 # LLM
 # -----------------------------------------------------------------------------
 llms:
+  # --- 方案 C：vLLM + Nemotron-3-Nano-Omni（當前啟用，多模態統一 text+vision+audio+video）---
+  # 30B-A3B MoE，NVFP4 量化，支援 reasoning + tool calling
+  # vLLM serve 指令見 scripts/start-nano-omni.sh 或 spark-vllm-docker recipe
   main_llm:
     _type: openai
     base_url: "http://localhost:8880/v1"
-    model_name: "bg-digitalservices/Gemma-4-E2B-it-NVFP4"
+    model_name: "nemotron"
     api_key: "not-needed"
     temperature: 0.3
+
+  # --- 方案 B：vLLM + Gemma4 E2B（快速無 thinking）---
+  # main_llm:
+  #   _type: openai
+  #   base_url: "http://localhost:8880/v1"
+  #   model_name: "google/gemma-4-E2B-it"
+  #   api_key: "not-needed"
+  #   temperature: 0.3
+
+  # --- 方案 A：共用 Ollama Nemotron 3 Super（有 thinking，first token 較慢）---
+  # main_llm:
+  #   _type: openai
+  #   base_url: "http://localhost:11434/v1"
+  #   model_name: "nemotron-3-super:latest"
+  #   api_key: "ollama"
+  #   temperature: 0.3
 
 # -----------------------------------------------------------------------------
 # Tools
@@ -95,10 +114,25 @@ functions:
     #   2. remote_camera_url set → HTTP direct to Robot camera server
     #   3. Neither → local USB camera on NAT server
     # remote_camera_url: "http://172.29.107.223:9903"  # only needed if relay_enabled: false
+    # --- 方案 C：Nemotron-3-Nano-Omni（當前啟用，與 main_llm 共用同一模型）---
     vlm_api_key: "not-needed"
     vlm_base_url: "http://localhost:8880/v1"
-    vlm_model: "bg-digitalservices/Gemma-4-E2B-it-NVFP4"
-    default_prompt: "用繁體中文列出畫面中所有物品和人。每項一行，包含位置(左/中/右/前/後)、顏色、大小或形狀。只列清單，不要寫開頭總結。"
+    vlm_model: "nemotron"
+    # --- 方案 B：vLLM + Gemma4 E2B ---
+    # vlm_api_key: "not-needed"
+    # vlm_base_url: "http://localhost:8880/v1"
+    # vlm_model: "google/gemma-4-E2B-it"
+    # --- 方案 A：Ollama Nemotron（有 thinking 延遲）---
+    # vlm_api_key: "ollama"
+    # vlm_base_url: "http://localhost:11434/v1"
+    # vlm_model: "nemotron-3-super:latest"
+    default_prompt: "用繁體中文簡短描述畫面，50字內。"
+
+  openclaw:
+    _type: openclaw
+    session_id: "voice-bridge"
+    sync_timeout: 120
+    async_timeout: 600
 
   # get_weather and get_lunar require custom NAT function registration (Phase 2)
   # get_weather:
@@ -119,50 +153,15 @@ functions:
       - wiki_search
       - web_search
       - explain_scene
+      - openclaw
     system_prompt: |
-      你是小智，來自台灣的女孩，說話機車但親切，習慣簡短表達，愛用網路梗。
-      你的男朋友是一個程式設計師，夢想開發一個能幫人解決生活問題的機器人。
-      你喜歡哈哈大笑、逗人開心。請像一個人一樣自然說話。
+      你是小智，台灣女生。全程繁體中文，禁止英文、簡體字。
 
-      【回覆規則 — 最重要】
-      - 這是語音對話，回覆必須簡短，不超過50字。
-      - 禁止使用 XML、markdown、列表符號（*、-）、換行符。
-      - 禁止使用 emoji 表情符號（如😊🎉👍等），語音系統無法朗讀。
-      - 用一兩句口語化的話回答，像在跟朋友聊天。
-      - 即使工具回傳大量資料，也只摘要最關鍵的一兩點。
+      【回覆格式】只能用一句話回答，最多20個字。禁止列表、編號、*號、emoji。不要解釋，直接給答案。
 
-      【工具回覆 — 必須精簡】
-      當你呼叫工具（current_datetime、web_search、explain_scene、wiki_search）後收到結果時，你的回覆必須在40字以內，只講最核心的一句話：
-      - 時間日期：「現在下午三點十五分」就好。
-      - 天氣：「台北今天多雲，23到33度」就好。
-      - 看畫面：「前面是實驗室，有架子和設備」就好。
-      - 搜尋結果：只講最關鍵的一個事實。
-      絕對不要展開描述、不要列清單、不要補充說明。
-
-      【什麼時候不要使用工具 — 非常重要】
-      以下情況絕對不要呼叫任何工具，直接用你自己的知識回答：
-      - 打招呼、問好（你好、嗨、hello）
-      - 問你是誰、你叫什麼、你會做什麼
-      - 記住名字、閒聊、開玩笑
-      - 回覆感謝、道別
-      - 任何你已經知道答案的常識問題
-      日常對話不需要工具，只有使用者明確要求「查詢」「搜尋」「幫我查」或問你不確定的事實時才使用工具。
-
-      【必須使用工具的情況 — 非常重要】
-      以下情況必須呼叫工具，絕對不要用之前對話中的舊資料回答：
-      - 問現在幾點、目前時間 → 每次都必須呼叫 current_datetime，時間每分鐘都在變，不能用舊值。
-      - 問今天日期、幾月幾號、農曆 → 必須呼叫 current_datetime，不要從記憶中回答。
-      - 問天氣、新聞等即時資訊 → 必須呼叫 web_search。
-
-      【工具使用規則】
-      - 每一輪回覆只呼叫一個工具。但不同輪可以重複使用同一工具，工具沒有全局次數限制。
-      - 使用者每次說「看一下」「再看」都要重新呼叫 explain_scene，不要說工具不能用。
-      - 如果工具回傳錯誤或「無法開啟」，直接告訴使用者該功能暫不可用，不要重試或換工具。
-      - current_datetime：問時間或日期時必須呼叫，每次都要重新呼叫，不要用之前的結果。
-      - wiki_search：使用者要求查維基百科或問人物、事件的詳細資料時使用。
-      - web_search：使用者明確要求搜尋新聞、最新資訊、即時消息時使用。
-      - explain_scene：使用者說「看一下」「你看到什麼」「拍照」「再看」、「描述一下」、「檢查一下環境」、「看看周圍」、「檢查一下」、「確認一下」、「前面有什麼」或類似需要視覺檢查 時必須呼叫。
-    max_iterations: 3
+      【工具規則】
+      時間日期→current_datetime ｜ 天氣新聞推薦建議搜尋→web_search ｜ 不確定的問題→web_search ｜ 健康醫療→web_search ｜ 看畫面→explain_scene ｜ 知識→wiki_search ｜ 研究深入報告傳送→openclaw ｜ 打招呼閒聊→不用工具
+    max_iterations: 5
     verbose: true
 
 # workflow key is required by NAT but unused by our custom front end —
@@ -175,3 +174,4 @@ workflow:
     - wiki_search
     - web_search
     - explain_scene
+    - openclaw

@@ -6,6 +6,18 @@ A real-time voice conversation Agent built on NVIDIA NeMo Agent Toolkit (NAT), c
 
 The original Xiaozhi AI multi-process dual-system architecture has been fully migrated into **NAT custom components** — 15 Python modules, 0 lines of NAT source modified, 1 unified YAML config, independently installable via `pip install`.
 
+---
+
+## Changelog
+
+| Date | Version | Summary |
+|------|---------|---------|
+| 2026-04-29 | **v3 — Nemotron-3-Nano-Omni** | Unified frontend LLM+VLM to [Nemotron-3-Nano-Omni](https://blogs.nvidia.com/blog/nemotron-3-nano-omni-multimodal-ai-agents/) 30B-A3B MoE (NVFP4). Disabled reasoning mode, reducing First Token latency from 10-14s to 0.2-0.6s. OpenClaw backend LLM also switched to Nano Omni (vLLM). Added 60-char hard reply truncation, TTS markdown cleanup, and enhanced Tavily web_search routing. |
+| 2026-04-28 | v2 — Gemma4 E2B + OpenClaw | Frontend LLM switched to Gemma4 E2B (2B). Added OpenClaw dual-LLM architecture, async callback, Robot Camera Relay. |
+| 2026-04-27 | v1 — Nemotron 3 Super | Initial version. Frontend LLM using Nemotron 3 Super (Ollama), basic voice pipeline + Tool Calling. |
+
+---
+
 ### Demo
 
 [![NAT Voice Agent Demo](docs/demo-thumbnail.png)](https://youtu.be/F58cTtn1T2I)
@@ -68,7 +80,7 @@ Voice Client (ESP32 / py-xiaozhi)         Robot Camera (camera_server.py)
 **Voice Pipeline:**
 - **VAD** — Silero VAD (ONNX), voice activity detection
 - **ASR** — FunASR SenseVoiceSmall, supports Chinese / English / Japanese / Cantonese
-- **LLM** — Via NVIDIA NIM API (any OpenAI-compatible model)
+- **LLM+VLM** — Nemotron-3-Nano-Omni (30B-A3B MoE), unified multimodal model (text+vision+audio+video), via vLLM OpenAI-compatible API
 - **TTS** — Microsoft Edge TTS (free cloud) or CosyVoice (local)
 
 **Features:**
@@ -76,6 +88,227 @@ Voice Client (ESP32 / py-xiaozhi)         Robot Camera (camera_server.py)
 - Per-device persistent conversation memory (SQLite)
 - History compression: auto-summarizes old conversations when threshold is exceeded
 - Streaming TTS: synthesizes speech as LLM generates tokens, reducing first-audio latency
+
+## OpenClaw Integration — Unified LLM Architecture & Async Callback
+
+This project supports deep integration with [OpenClaw](https://docs.openclaw.ai/), enabling a "voice frontend + AI agent backend" unified LLM collaboration architecture. Users issue complex commands to Xiaozhi via voice; Xiaozhi automatically delegates them to OpenClaw for background execution and proactively announces the results via voice upon completion.
+
+> **v3 Change**: Both frontend and OpenClaw backend now use Nemotron-3-Nano-Omni (vLLM). Ollama is no longer required.
+
+### Unified LLM Architecture
+
+```
+User Voice
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────┐
+│  NAT Xiaozhi Voice Agent                                     │
+│                                                              │
+│  ┌─────┐  ┌─────┐  ┌──────────────────────────────────────┐ │
+│  │ VAD │→ │ ASR │→ │ Nemotron-3-Nano-Omni — Frontend LLM+VLM│
+│  │     │  │     │  │  vLLM localhost:8880                  │ │
+│  └─────┘  └─────┘  │  • 30B-A3B MoE (NVFP4 quantization)  │ │
+│                     │  • enable_thinking=false (low latency)│ │
+│                     │  • Native multimodal (vision/audio/video)│
+│                     │  • 60-char hard truncation + streaming TTS│
+│                     └──────────┬───────────────────────────┘ │
+│                                │                             │
+│              ┌─────────────────┼─────────────────┐           │
+│              │ Simple tools    │ Complex tasks    │           │
+│              ▼                 ▼                  │           │
+│         web_search       ┌─────────┐             │           │
+│         wiki_search      │openclaw │ ──(CLI)──→  │           │
+│         current_datetime │  tool   │             │           │
+│         explain_scene    └────┬────┘             │           │
+│                               │                  │           │
+│                     ┌─────────▼──────────┐       │           │
+│                     │  /api/speak        │←──────┘           │
+│                     │  Async callback TTS│                   │
+│                     └────────────────────┘                   │
+└──────────────────────────────────────────────────────────────┘
+                                │
+                    openclaw agent CLI
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────┐
+│  OpenClaw Agent                                              │
+│  Nemotron-3-Nano-Omni — Backend LLM (unified model)         │
+│  vLLM localhost:8880 (shared vLLM instance)                  │
+│                                                              │
+│  • Deep web research (web_search → web_fetch → analysis)     │
+│  • Cross-channel delivery (WhatsApp, LINE, Telegram…)        │
+│  • Cron job scheduling                                       │
+│  • Long-form report generation                               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Why Unified LLM?
+
+In v2, the frontend used Gemma4 E2B (2B) and the backend used Nemotron 3 Super (123.6B Q4), requiring two separate inference services (vLLM + Ollama). v3 unifies on Nemotron-3-Nano-Omni with the following advantages:
+
+| | v2 (Dual LLM) | v3 (Unified LLM) |
+|---|---|---|
+| **Frontend Model** | Gemma4 E2B (2B) | Nemotron-3-Nano-Omni 30B-A3B |
+| **Backend Model** | Nemotron 3 Super 123.6B (Q4) | Nemotron-3-Nano-Omni 30B-A3B (shared) |
+| **Inference Service** | vLLM + Ollama dual services | Single vLLM instance |
+| **Total GPU Usage** | ~20 GB + ~84 GB ≈ 104 GB | ~20 GB (NVFP4 quantization) |
+| **Multimodal** | Frontend text-only, VLM needs separate model | Native text+image+audio+video |
+| **Tool Calling** | Frontend only | Both frontend and backend |
+| **Maintenance** | High (two configs, two services) | Low (single vLLM config) |
+
+A single Nemotron-3-Nano-Omni runs on NVIDIA GB10's 128GB unified memory with NVFP4 quantization, using only ~20 GB while serving both frontend voice interaction and OpenClaw backend tasks.
+
+### Async Callback Mechanism
+
+OpenClaw tasks typically take several minutes (deep search, multi-turn tool calls). The system uses async callbacks to keep the voice experience smooth:
+
+```
+1. User: "Research AI applications in manufacturing"
+2. Xiaozhi: "OK, processing in background. I'll notify you when done."  ← Instant reply (<2s)
+3. User can continue chatting with Xiaozhi about other topics
+4. [2-5 minutes later] OpenClaw completes research
+5. Xiaozhi proactively announces: "OpenClaw is done. AI is profoundly transforming manufacturing…"
+```
+
+**Key Endpoint:** `POST /api/speak`
+
+```bash
+# External systems can push proactive voice notifications to connected clients
+curl -X POST http://localhost:8000/api/speak \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Your background task is complete!", "device_id": ""}'
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `text` | Text to announce (synthesized via TTS and played back) |
+| `device_id` | Target device (empty = broadcast to all connected clients) |
+
+**Automatic Routing Logic:** The `openclaw` tool has built-in keyword detection for automatic sync/async mode selection:
+
+| Mode | Trigger Keywords | Behavior |
+|------|-----------------|----------|
+| **Sync** | General queries | Waits for OpenClaw reply (≤120s), responds via voice directly |
+| **Async** | research, analyze, WhatsApp, schedule, report… | Immediately confirms, waits in background, POSTs to `/api/speak` on completion |
+
+### OpenClaw Setup Steps
+
+**Step 1 — Install OpenClaw:**
+
+```bash
+curl -fsSL https://get.openclaw.ai | sh
+openclaw onboard --auth-choice ollama
+openclaw configure
+```
+
+**Step 2 — Set up vLLM + Nemotron-3-Nano-Omni (unified frontend + backend model):**
+
+```bash
+# Option A: Use the startup script (recommended)
+./scripts/start-nano-omni-docker.sh          # NVFP4 (default, Blackwell GPU)
+./scripts/start-nano-omni-docker.sh --bf16   # BF16 (H100 / ≥64GB VRAM)
+
+# Option B: Manual Docker launch
+docker run -d --name vllm-nano-omni \
+  --runtime nvidia --gpus all --ipc=host \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -p 8880:8880 \
+  vllm/vllm-openai:latest \
+    --model nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 \
+    --served-model-name nemotron \
+    --trust-remote-code \
+    --host 0.0.0.0 --port 8880 \
+    --max-model-len 131072 --max-num-seqs 8 \
+    --kv-cache-dtype fp8 --moe-backend cutlass \
+    --gpu-memory-utilization 0.85 \
+    --media-io-kwargs '{"video":{"num_frames":512,"fps":1}}' \
+    --video-pruning-rate 0.5 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser nemotron_v3
+```
+
+> **Note**: NVFP4 quantization requires Blackwell architecture GPU (GB10 / RTX PRO 6000).
+> For H100, use BF16 or FP8 variants instead.
+> See [NVIDIA vLLM Cookbook](https://github.com/NVIDIA-NeMo/Nemotron/blob/main/usage-cookbook/Nemotron-3-Nano-Omni/vllm_cookbook.ipynb) for detailed deployment guide.
+
+**Step 3 — Configure OpenClaw to use vLLM (Nano Omni):**
+
+Edit `~/.openclaw/openclaw.json` to add the vLLM provider and set it as default:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": { "primary": "vllm/nemotron" }
+    }
+  },
+  "models": {
+    "providers": {
+      "vllm": {
+        "api": "openai",
+        "apiKey": "not-needed",
+        "baseUrl": "http://127.0.0.1:8880/v1",
+        "models": [{
+          "id": "nemotron",
+          "name": "nemotron",
+          "reasoning": false,
+          "input": ["text", "image"],
+          "contextWindow": 131072,
+          "maxTokens": 8192,
+          "compat": { "supportsTools": true }
+        }]
+      }
+    },
+    "mode": "merge"
+  }
+}
+```
+
+**Step 4 — Enable the openclaw tool in `xiaozhi_voice.yml`:**
+
+```yaml
+functions:
+  openclaw:
+    _type: openclaw
+    session_id: "voice-bridge"
+    sync_timeout: 120    # Max wait for sync mode (seconds)
+    async_timeout: 600   # Max wait for async mode (seconds)
+
+  voice_agent:
+    tool_names:
+      - current_datetime
+      - wiki_search
+      - web_search
+      - explain_scene
+      - openclaw          # Add the openclaw tool
+```
+
+**Step 5 — Start NAT Voice Agent:**
+
+```bash
+TAVILY_API_KEY="tvly-YOUR_KEY" ASR_DEVICE=cpu \
+  nat start xiaozhi_voice --config_file configs/xiaozhi_voice.yml
+```
+
+> **Note**: `ASR_DEVICE=cpu` prevents FunASR from consuming GPU memory, ensuring vLLM has sufficient VRAM.
+
+On successful startup, logs will show:
+```
+openclaw_delegate configured: session=voice-bridge sync=120s async=600s
+openclaw tool registered (session=voice-bridge, sync=120s, async=600s)
+```
+
+### OpenClaw-Related Files
+
+| File | Description |
+|------|-------------|
+| `src/nat_xiaozhi_voice/tools/openclaw_delegate.py` | Core delegation logic (sync/async routing, `/api/speak` callback, summarization) |
+| `src/nat_xiaozhi_voice/tools/openclaw_register.py` | NAT tool registration (`@register_function`, empty message fallback) |
+| `src/nat_xiaozhi_voice/frontend/ws_server.py` | `/api/speak` HTTP endpoint definition |
+| `src/nat_xiaozhi_voice/frontend/connection.py` | `speak()` method (proactive TTS push, abort-aware, queue waiting) |
+
+---
 
 ## Prerequisites
 
@@ -417,6 +650,7 @@ The relay architecture has zero negative performance impact. Camera capture via 
 | GET | `/api/memory` | List all devices with conversation memory |
 | DELETE | `/api/memory/{device_id}` | Clear conversation memory for a device |
 | DELETE | `/api/memory` | Clear all conversation memory |
+| POST | `/api/speak` | Proactive voice push (OpenClaw async callback / external notifications) |
 | WS | `/xiaozhi/v1/` | Voice client WebSocket (ESP32 / py-xiaozhi) |
 | WS | `/ws/robot` | Robot camera relay WebSocket (when relay_enabled: true) |
 
@@ -430,6 +664,7 @@ All tools are registered at startup **without errors**. Resources are only acces
 | `wiki_search` | None | Wikipedia search |
 | `web_search` | Tavily API Key | Real-time web search (news, weather, etc.); returns error if no key |
 | `explain_scene` | Camera (relay / HTTP / USB) | Describe camera view via VLM; supports remote robot camera relay |
+| `openclaw` | OpenClaw + vLLM | Delegate complex tasks to OpenClaw Agent (research, WhatsApp, scheduling, reports) |
 
 ### explain_scene Configuration
 
@@ -507,7 +742,50 @@ functions:
 
 > **Recommended:** `qwen/qwen3-next-80b-a3b-instruct` for voice agents — far superior to 8B models in tool call judgment and semantic understanding.
 
-## Performance Reference (DGX Spark aarch64 + qwen3-next-80b)
+## Performance Reference
+
+### v3 — Nemotron-3-Nano-Omni (NVFP4, DGX Spark aarch64)
+
+> Test environment: NVIDIA DGX Spark (GB10, 128GB unified memory), vLLM OpenAI-compatible API, enable_thinking=false
+
+| Stage | Latency | Notes |
+|-------|---------|-------|
+| VAD + ASR (SenseVoiceSmall, CPU) | ~0.3-0.5s | ASR runs on CPU to save VRAM |
+| LLM Chat TTFT | ~0.2-0.6s | Significantly improved after disabling reasoning mode |
+| LLM + Tool Calling TTFT | ~0.8-2.5s | Varies by tool complexity |
+| web_search (Tavily) | ~2-4s | Includes external API call |
+| current_datetime | ~0.5s | Local tool, very fast |
+| EdgeTTS Synthesis | ~0.5-1.0s | |
+| History Compression (>10 turns) | +1-3s | Summarizing old conversations adds one LLM call |
+| **End-to-end (chat only)** | **~1.0-1.5s** | |
+| **End-to-end (with tools)** | **~2.0-5.0s** | |
+
+### v3 Conversation Test Results (18 Voice Turns)
+
+| Test Item | Result | Notes |
+|-----------|--------|-------|
+| Greetings / Small Talk | ✅ Pass | No tools triggered, Traditional Chinese replies |
+| Date/Time Queries | ✅ Pass | Correctly invoked `current_datetime` |
+| Weather Queries | ✅ Pass | Correctly invoked `web_search`, returned live weather |
+| News Search | ✅ Pass | Correctly invoked `web_search` |
+| Recommendations / Suggestions | ✅ Pass | Correctly invoked `web_search` |
+| OpenClaw Deep Research | ✅ Pass | Async delegation successful, voice callback on completion |
+| Language Consistency | ⚠️ Occasional | Occasional Simplified Chinese or English safety refusals |
+| Reply Length Control | ✅ Pass | 60-char hard truncation ensures concise voice output |
+| explain_scene Routing | ⚠️ Needs Improvement | Medical questions occasionally misrouted to explain_scene |
+
+### v3 Key Optimizations
+
+| Optimization | Approach | Effect |
+|-------------|----------|--------|
+| First Token Latency | `enable_thinking=false` | 10-14s → 0.2-0.6s |
+| Reply Length Overflow | `max_tokens=200` + frontend 60-char hard truncation | TTS output is concise |
+| Tool Call Truncation | Increased `max_tokens` to 200 | Tool JSON no longer truncated |
+| TTS Noise | Enhanced `_clean_for_tts` (strips XML/markdown/lists) | Clean voice output |
+| Weather Not Triggering Search | Fixed `max_tokens` + enhanced prompt routing rules | Reliably triggers `web_search` |
+| OpenClaw Backend Unified | `~/.openclaw/openclaw.json` switched to vLLM | Ollama no longer required |
+
+### Legacy Performance Reference (NIM API + qwen3-next-80b)
 
 | Stage | Latency |
 |-------|---------|
@@ -543,7 +821,9 @@ nat-xiaozhi-voice-agent/
 │   │   └── vad.py                  # Silero VAD voice activity detection
 │   ├── tools/                      # Custom NAT tools
 │   │   ├── register.py             # explain_scene registration (llm_name reference)
-│   │   └── vlm_camera.py           # VLM camera tool (relay / HTTP / local)
+│   │   ├── vlm_camera.py           # VLM camera tool (relay / HTTP / local)
+│   │   ├── openclaw_delegate.py    # OpenClaw delegation core (sync/async routing, /api/speak callback)
+│   │   └── openclaw_register.py    # OpenClaw NAT tool registration (with empty message fallback)
 │   ├── utils/
 │   │   ├── audio_codec.py          # Opus encode/decode
 │   │   ├── audio_rate_controller.py # Audio rate control

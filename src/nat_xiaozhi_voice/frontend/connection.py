@@ -179,6 +179,71 @@ class ConnectionHandler:
 
         self._rate_ctrl.add_message(_send_listen)
 
+    # ── proactive speak (called from /api/speak) ────────────────────
+
+    async def speak(self, text: str):
+        """Proactively synthesize *text* via TTS and push to the client.
+
+        If TTS is already playing (e.g. user conversation), waits up to 60s
+        for it to finish before speaking.  Respects abort at every stage.
+        """
+        if self._closed or self.ws.client_state != WebSocketState.CONNECTED:
+            return
+
+        for _ in range(120):  # 120 * 0.5s = 60s max wait
+            if not self._tts_playing:
+                break
+            if self._abort_requested:
+                logger.info("speak() cancelled by abort during wait on session=%s", self.session_id)
+                return
+            await asyncio.sleep(0.5)
+        else:
+            logger.warning("speak() gave up waiting for TTS on session=%s", self.session_id)
+            return
+
+        if self._closed or self.ws.client_state != WebSocketState.CONNECTED:
+            return
+        if self._abort_requested:
+            return
+
+        self._abort_requested = False
+        logger.info("Proactive speak to device=%s: %s", self.device_id, text[:60])
+        await self._send_json({"type": "tts", "state": "start", "session_id": self.session_id})
+        self._tts_playing = True
+        self._rate_ctrl.reset()
+        self._rate_task = self._rate_ctrl.start(self._send_audio_frame)
+
+        frame_count = 0
+
+        def _on_frame(opus_bytes: bytes):
+            nonlocal frame_count
+            frame_count += 1
+            self._rate_ctrl.add_audio(opus_bytes)
+
+        await self._send_json({"type": "llm", "text": text, "session_id": self.session_id})
+
+        try:
+            await self._tts.synthesize_stream(text, 24000, _on_frame)
+        except Exception:
+            logger.exception("TTS error during proactive speak")
+
+        if self._abort_requested:
+            self._tts_playing = False
+            logger.info("speak() aborted after TTS on session=%s", self.session_id)
+            return
+
+        async def _send_stop():
+            await self._send_json({"type": "tts", "state": "stop", "session_id": self.session_id})
+            self._tts_playing = False
+
+        self._rate_ctrl.add_message(_send_stop)
+
+        async def _send_listen():
+            await self._send_json({"type": "listen", "state": "start", "session_id": self.session_id})
+
+        self._rate_ctrl.add_message(_send_listen)
+        logger.info("Proactive speak queued %d frames for device=%s", frame_count, self.device_id)
+
     # ── text messages ─────────────────────────────────────────────────
 
     async def _on_text(self, raw: str):

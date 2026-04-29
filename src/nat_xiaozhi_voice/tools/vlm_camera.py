@@ -9,6 +9,10 @@ Supports two camera sources:
 In both cases, the captured image is sent to a vision-language model
 (VLM) running on the NAT server for scene description.
 
+Compatible with reasoning models (e.g. Nemotron-3-Nano-Omni) — the
+``<think>`` reasoning trace is stripped from the output automatically,
+and ``enable_thinking`` is set to False for faster VLM responses.
+
 Thread safety: all OpenCV calls are serialised through an asyncio Lock
 and run in the default executor so the event loop is never blocked.
 """
@@ -18,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 import time
 from typing import Optional
 
@@ -36,6 +41,8 @@ _default_prompt: str = "用繁體中文列出畫面中所有物品和人。每�
 
 _remote_camera_url: str = ""
 _use_relay: bool = False
+
+_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
 
 def configure(
@@ -221,14 +228,15 @@ async def analyze_scene(query: str = "") -> str:
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": prompt_text},
                             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}},
+                            {"type": "text", "text": prompt_text},
                         ],
                     }
                 ],
-                max_tokens=150,
+                max_tokens=200,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             ),
-            timeout=15.0,
+            timeout=30.0,
         )
     except asyncio.TimeoutError:
         elapsed = time.time() - t_cap
@@ -240,6 +248,7 @@ async def analyze_scene(query: str = "") -> str:
 
     msg = response.choices[0].message
     result = msg.content or ""
+    result = _THINK_RE.sub("", result).strip()
     if not result:
         logger.warning(
             "VLM returned empty content. finish_reason=%s, refusal=%s, role=%s, raw=%s",

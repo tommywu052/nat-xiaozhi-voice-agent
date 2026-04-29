@@ -44,6 +44,7 @@ dependencies = [
 [project.entry-points.'nat.components']
 nat_xiaozhi_voice_workflow = "nat_xiaozhi_voice.workflow.register"
 nat_xiaozhi_voice_tools = "nat_xiaozhi_voice.tools.register"
+nat_xiaozhi_voice_openclaw = "nat_xiaozhi_voice.tools.openclaw_register"
 
 [project.entry-points.'nat.front_ends']
 nat_xiaozhi_voice_frontend = "nat_xiaozhi_voice.frontend.register"

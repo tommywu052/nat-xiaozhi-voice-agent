@@ -307,12 +307,14 @@ async def ws_main():
 
     print(f"[WS] 正在連接 {WS_SERVER_URL} ...")
 
-    async with websockets.connect(
-        WS_SERVER_URL,
-        extra_headers=headers,
-        ping_interval=30,
-        ping_timeout=120,
-    ) as ws:
+    # websockets >=14 renamed extra_headers → additional_headers
+    ws_kwargs = dict(ping_interval=30, ping_timeout=120)
+    if hasattr(websockets, 'version') and int(websockets.version.split('.')[0]) >= 14:
+        ws_kwargs['additional_headers'] = headers
+    else:
+        ws_kwargs['extra_headers'] = headers
+
+    async with websockets.connect(WS_SERVER_URL, **ws_kwargs) as ws:
         ws_connection = ws
         print("[WS] WebSocket 連線成功！")
         print("[操作說明] 按住空白鍵說話，放開停止；ESC 退出")

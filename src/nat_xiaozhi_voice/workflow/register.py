@@ -41,8 +41,9 @@ if typing.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_SYSTEM_PROMPT = (
-    "你是小智，來自台灣的 AI 語音助手。說話簡短精準，適合語音場景。"
-    "當需要即時資訊時，請主動使用工具。每個工具最多調用一次。"
+    "你是小智，來自台灣的 AI 語音助手。全程使用繁體中文回覆，禁止簡體字。"
+    "說話簡短精準，適合語音場景。"
+    "禁止自行猜測即時資訊，問日期時間必須呼叫 current_datetime 工具。"
 )
 
 MEMORY_DB_PATH = os.environ.get("XIAOZHI_MEMORY_DB", "xiaozhi_memory.db")
@@ -80,7 +81,17 @@ async def voice_agent_workflow(config: VoiceAgentWorkflowConfig, builder: Builde
         tool = await builder.get_tool(name, wrapper_type=LLMFrameworkEnum.LANGCHAIN)
         tools.append(tool)
 
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
+    # Disable reasoning/thinking mode to reduce first-token latency.
+    # max_tokens caps reply length for voice-friendly output (~60 Chinese chars).
+    # extra_body must be passed inside bind_tools to survive the RunnableBinding chain.
+    _NO_THINKING = {"chat_template_kwargs": {"enable_thinking": False}}
+    _LLM_KWARGS = {"extra_body": _NO_THINKING, "max_tokens": 200}
+    if tools:
+        llm_with_tools = llm.bind_tools(
+            tools, parallel_tool_calls=False, **_LLM_KWARGS
+        )
+    else:
+        llm_with_tools = llm.bind(**_LLM_KWARGS)
 
     # ── Custom state with summary field ──────────────────────────
     from langgraph.graph import MessagesState
@@ -128,7 +139,8 @@ async def voice_agent_workflow(config: VoiceAgentWorkflowConfig, builder: Builde
 
         text_block = "\n".join(conv_lines[-30:])
         try:
-            resp = await llm.ainvoke([
+            compress_llm = llm.bind(extra_body=_NO_THINKING)
+            resp = await compress_llm.ainvoke([
                 HumanMessage(content=(
                     "Summarize the following conversation in Traditional Chinese, 200 chars max.\n"
                     "MUST keep: user's name, preferences, and key topics discussed.\n"

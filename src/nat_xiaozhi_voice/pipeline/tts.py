@@ -36,11 +36,17 @@ EMOJI_RE = re.compile(
 
 def _clean_for_tts(text: str) -> str:
     text = EMOJI_RE.sub("", text)
+    text = re.sub(r"<[^>]+>", "", text)  # strip XML/HTML-like tags
     text = re.sub(r"\*+", "", text)
     text = re.sub(r"#+\s*", "", text)
     text = re.sub(r"[`~]", "", text)
     text = re.sub(r"[()（）\[\]【】{}「」『』<>《》]", "", text)
-    return text.strip()
+    text = re.sub(r"^\s*\d+\.\s*", "", text, flags=re.MULTILINE)  # numbered lists
+    text = re.sub(r"^\s*[-•]\s*", "", text, flags=re.MULTILINE)  # bullet lists
+    text = re.sub(r"\n{2,}", "，", text)  # collapse double newlines
+    text = re.sub(r"\n", "，", text)  # newlines to comma
+    text = re.sub(r"，{2,}", "，", text)  # dedup commas
+    return text.strip().strip("，")
 
 
 def _pcm_to_opus_frames(

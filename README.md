@@ -8,6 +8,16 @@
 
 ---
 
+## 更新紀錄
+
+| 日期 | 版本 | 變更摘要 |
+|------|------|---------|
+| 2026-04-29 | **v3 — Nemotron-3-Nano-Omni** | 前端 LLM+VLM 統一為 [Nemotron-3-Nano-Omni](https://blogs.nvidia.com/blog/nemotron-3-nano-omni-multimodal-ai-agents/) 30B-A3B MoE (NVFP4)。關閉 reasoning 模式，First Token 從 10-14s 降至 0.2-0.6s。OpenClaw 後端 LLM 同步換為 Nano Omni (vLLM)。新增 60 字硬性回覆截斷、TTS markdown 清理、Tavily web_search 強化路由。 |
+| 2026-04-28 | v2 — Gemma4 E2B + OpenClaw | 前端 LLM 換為 Gemma4 E2B (2B)，新增 OpenClaw 雙 LLM 架構、非同步回呼、Robot Camera Relay。 |
+| 2026-04-27 | v1 — Nemotron 3 Super | 初版。前端 LLM 使用 Nemotron 3 Super (Ollama)，基本語音管線 + Tool Calling。 |
+
+---
+
 ### Qwen3-Omni 端到端版本
 
 > **有大 VRAM GPU？** 試試 [`qwen-omni`](https://github.com/tommywu052/nat-xiaozhi-voice-agent/tree/qwen-omni) 分支——使用 Qwen3-Omni 單次 API 呼叫同時完成語音理解、推理、語音合成，不需要外部 ASR 或 TTS 服務。
@@ -90,7 +100,7 @@ git checkout qwen-omni
 **語音管線：**
 - **VAD** — Silero VAD (ONNX)，偵測語音活動
 - **ASR** — FunASR SenseVoiceSmall，支援中/英/日/粵語
-- **LLM** — 透過 NVIDIA NIM API 呼叫（可替換任意 OpenAI-compatible 模型）
+- **LLM+VLM** — Nemotron-3-Nano-Omni (30B-A3B MoE)，統一多模態模型（text+vision+audio+video），透過 vLLM OpenAI-compatible API
 - **TTS** — Microsoft Edge TTS（免費雲端）或 CosyVoice（本地）
 
 **特性：**
@@ -98,6 +108,227 @@ git checkout qwen-omni
 - 每裝置獨立對話記憶（SQLite 持久化）
 - 歷史壓縮：超過閾值時自動摘要舊對話
 - 串流 TTS：LLM 邊生成邊合成語音，降低首音延遲
+
+## OpenClaw 整合 — 統一 LLM 架構與非同步回呼
+
+本專案支援與 [OpenClaw](https://docs.openclaw.ai/) 深度整合，實現「語音前端 + AI Agent 後端」的統一 LLM 協作架構。使用者透過語音對小智下達複雜指令，小智自動委派給 OpenClaw 在背景執行，完成後主動語音通知結果。
+
+> **v3 變更**：前端與 OpenClaw 後端統一使用 Nemotron-3-Nano-Omni (vLLM)，不再需要 Ollama。
+
+### 統一 LLM 架構
+
+```
+使用者語音
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────┐
+│  NAT 小智 Voice Agent                                        │
+│                                                              │
+│  ┌─────┐  ┌─────┐  ┌──────────────────────────────────────┐ │
+│  │ VAD │→ │ ASR │→ │ Nemotron-3-Nano-Omni — 前端 LLM+VLM  │ │
+│  │     │  │     │  │  vLLM localhost:8880                  │ │
+│  └─────┘  └─────┘  │  • 30B-A3B MoE (NVFP4 量化)          │ │
+│                     │  • enable_thinking=false（低延遲）    │ │
+│                     │  • 原生多模態 (vision/audio/video)     │ │
+│                     │  • 60 字硬截斷 + 串流 TTS             │ │
+│                     └──────────┬───────────────────────────┘ │
+│                                │                             │
+│              ┌─────────────────┼─────────────────┐           │
+│              │ 簡單工具        │ 複雜任務         │           │
+│              ▼                 ▼                  │           │
+│         web_search       ┌─────────┐             │           │
+│         wiki_search      │openclaw │ ──(CLI)──→  │           │
+│         current_datetime │  tool   │             │           │
+│         explain_scene    └────┬────┘             │           │
+│                               │                  │           │
+│                     ┌─────────▼──────────┐       │           │
+│                     │  /api/speak        │←──────┘           │
+│                     │  非同步回呼 TTS     │                   │
+│                     └────────────────────┘                   │
+└──────────────────────────────────────────────────────────────┘
+                                │
+                    openclaw agent CLI
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────┐
+│  OpenClaw Agent                                              │
+│  Nemotron-3-Nano-Omni — 後端 LLM（統一模型）                 │
+│  vLLM localhost:8880（共用同一 vLLM 實例）                    │
+│                                                              │
+│  • 深度網路搜尋（web_search → web_fetch → 分析）             │
+│  • 跨頻道傳送（WhatsApp、LINE、Telegram…）                   │
+│  • Cron 排程任務                                             │
+│  • 長篇報告生成                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 為什麼統一 LLM？
+
+在 v2 架構中，前端使用 Gemma4 E2B (2B)、後端使用 Nemotron 3 Super (123.6B Q4)，需要同時運行 vLLM 和 Ollama 兩套推論服務。v3 統一使用 Nemotron-3-Nano-Omni，帶來以下優勢：
+
+| | v2（雙 LLM） | v3（統一 LLM） |
+|---|---|---|
+| **前端模型** | Gemma4 E2B (2B) | Nemotron-3-Nano-Omni 30B-A3B |
+| **後端模型** | Nemotron 3 Super 123.6B (Q4) | Nemotron-3-Nano-Omni 30B-A3B（共用） |
+| **推論服務** | vLLM + Ollama 雙服務 | 單一 vLLM 實例 |
+| **GPU 總佔用** | ~20 GB + ~84 GB ≈ 104 GB | ~20 GB（NVFP4 量化） |
+| **多模態** | 前端純文字、VLM 需另外模型 | 原生 text+image+audio+video |
+| **Tool Calling** | 前端支援 | 前後端皆支援 |
+| **維護複雜度** | 高（兩套配置、兩套服務） | 低（一套 vLLM 配置） |
+
+單一 Nemotron-3-Nano-Omni 在 NVIDIA GB10 的 128GB 統一記憶體上以 NVFP4 量化運行，僅佔 ~20 GB，同時服務前端語音互動與 OpenClaw 後端任務。
+
+### 非同步回呼機制
+
+OpenClaw 任務通常需要數分鐘（深度搜尋、多輪工具呼叫）。系統採用非同步回呼確保語音體驗流暢：
+
+```
+1. 使用者：「幫我研究 AI 在製造業的應用」
+2. 小智：「好的，已在背景處理中，完成後會語音通知你。」  ← 立即回覆（<2s）
+3. 使用者可繼續和小智對話其他問題
+4. [2-5 分鐘後] OpenClaw 完成研究
+5. 小智主動語音播報：「OpenClaw 完成了。AI 正深刻改變製造業…」
+```
+
+**關鍵端點：** `POST /api/speak`
+
+```bash
+# 外部系統可主動推送語音通知給連線中的客戶端
+curl -X POST http://localhost:8000/api/speak \
+  -H "Content-Type: application/json" \
+  -d '{"text": "你的背景任務完成了！", "device_id": ""}'
+```
+
+| 參數 | 說明 |
+|------|------|
+| `text` | 要播報的文字（會經 TTS 合成後播放） |
+| `device_id` | 指定設備（空值 = 廣播給所有連線客戶端） |
+
+**自動路由邏輯：** `openclaw` 工具內建關鍵字偵測，自動判斷同步/非同步模式：
+
+| 模式 | 觸發關鍵字 | 行為 |
+|------|-----------|------|
+| **同步** | 一般查詢 | 等待 OpenClaw 回覆（≤120s），直接語音回覆 |
+| **非同步** | 研究、分析、WhatsApp、排程、報告… | 立即回覆確認，背景等待，完成後 POST `/api/speak` |
+
+### OpenClaw 整合設定步驟
+
+**Step 1 — 安裝 OpenClaw：**
+
+```bash
+curl -fsSL https://get.openclaw.ai | sh
+openclaw onboard --auth-choice ollama
+openclaw configure
+```
+
+**Step 2 — 設定 vLLM + Nemotron-3-Nano-Omni（前端+後端統一模型）：**
+
+```bash
+# 方法 A：使用啟動腳本（推薦）
+./scripts/start-nano-omni-docker.sh          # NVFP4（預設，Blackwell GPU）
+./scripts/start-nano-omni-docker.sh --bf16   # BF16（H100 / ≥64GB VRAM）
+
+# 方法 B：手動 Docker 啟動
+docker run -d --name vllm-nano-omni \
+  --runtime nvidia --gpus all --ipc=host \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -p 8880:8880 \
+  vllm/vllm-openai:latest \
+    --model nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 \
+    --served-model-name nemotron \
+    --trust-remote-code \
+    --host 0.0.0.0 --port 8880 \
+    --max-model-len 131072 --max-num-seqs 8 \
+    --kv-cache-dtype fp8 --moe-backend cutlass \
+    --gpu-memory-utilization 0.85 \
+    --media-io-kwargs '{"video":{"num_frames":512,"fps":1}}' \
+    --video-pruning-rate 0.5 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser nemotron_v3
+```
+
+> **注意**：NVFP4 量化需要 Blackwell 架構 GPU（GB10 / RTX PRO 6000）。
+> 如使用 H100，請改用 BF16 或 FP8 變體。
+> 詳細部署指南見 [NVIDIA vLLM Cookbook](https://github.com/NVIDIA-NeMo/Nemotron/blob/main/usage-cookbook/Nemotron-3-Nano-Omni/vllm_cookbook.ipynb)。
+
+**Step 3 — 設定 OpenClaw 使用 vLLM（Nano Omni）：**
+
+編輯 `~/.openclaw/openclaw.json`，新增 vLLM provider 並設為預設：
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": { "primary": "vllm/nemotron" }
+    }
+  },
+  "models": {
+    "providers": {
+      "vllm": {
+        "api": "openai",
+        "apiKey": "not-needed",
+        "baseUrl": "http://127.0.0.1:8880/v1",
+        "models": [{
+          "id": "nemotron",
+          "name": "nemotron",
+          "reasoning": false,
+          "input": ["text", "image"],
+          "contextWindow": 131072,
+          "maxTokens": 8192,
+          "compat": { "supportsTools": true }
+        }]
+      }
+    },
+    "mode": "merge"
+  }
+}
+```
+
+**Step 4 — 在 `xiaozhi_voice.yml` 中啟用 openclaw 工具：**
+
+```yaml
+functions:
+  openclaw:
+    _type: openclaw
+    session_id: "voice-bridge"
+    sync_timeout: 120    # 同步模式最長等待（秒）
+    async_timeout: 600   # 非同步模式最長等待（秒）
+
+  voice_agent:
+    tool_names:
+      - current_datetime
+      - wiki_search
+      - web_search
+      - explain_scene
+      - openclaw          # 加入 openclaw 工具
+```
+
+**Step 5 — 啟動 NAT Voice Agent：**
+
+```bash
+TAVILY_API_KEY="tvly-YOUR_KEY" ASR_DEVICE=cpu \
+  nat start xiaozhi_voice --config_file configs/xiaozhi_voice.yml
+```
+
+> **注意**：`ASR_DEVICE=cpu` 避免 FunASR 佔用 GPU 記憶體，確保 vLLM 有足夠 VRAM。
+
+啟動成功後日誌會顯示：
+```
+openclaw_delegate configured: session=voice-bridge sync=120s async=600s
+openclaw tool registered (session=voice-bridge, sync=120s, async=600s)
+```
+
+### OpenClaw 相關檔案
+
+| 檔案 | 說明 |
+|------|------|
+| `src/nat_xiaozhi_voice/tools/openclaw_delegate.py` | 核心委派邏輯（sync/async 路由、`/api/speak` 回呼、摘要） |
+| `src/nat_xiaozhi_voice/tools/openclaw_register.py` | NAT 工具註冊（`@register_function`、空 message fallback） |
+| `src/nat_xiaozhi_voice/frontend/ws_server.py` | `/api/speak` HTTP endpoint 定義 |
+| `src/nat_xiaozhi_voice/frontend/connection.py` | `speak()` 方法（主動 TTS 推送、abort 感知、等待排隊） |
+
+---
 
 ## 前置需求
 
@@ -435,6 +666,7 @@ Relay 架構對效能零負面影響。Camera capture 透過 in-process WebSocke
 | GET | `/api/memory` | 列出所有有對話記憶的裝置 |
 | DELETE | `/api/memory/{device_id}` | 清除指定裝置的對話記憶 |
 | DELETE | `/api/memory` | 清除所有裝置的對話記憶 |
+| POST | `/api/speak` | 主動語音推送（OpenClaw 非同步回呼 / 外部通知） |
 | WS | `/xiaozhi/v1/` | 語音客戶端 WebSocket（ESP32 / py-xiaozhi） |
 | WS | `/ws/robot` | Robot 攝影機 relay WebSocket（當 relay_enabled: true） |
 
@@ -448,6 +680,7 @@ Relay 架構對效能零負面影響。Camera capture 透過 in-process WebSocke
 | `wiki_search` | 無 | 維基百科搜尋 |
 | `web_search` | Tavily API Key | 即時網路搜尋（新聞、天氣等）；無 Key 時回傳錯誤訊息 |
 | `explain_scene` | USB 攝影機 | 透過 VLM 描述攝影機畫面；無攝影機時回傳「無法開啟攝影機」 |
+| `openclaw` | OpenClaw + vLLM | 委派複雜任務給 OpenClaw Agent（研究、WhatsApp、排程、報告） |
 
 ### explain_scene 工具設定
 
@@ -525,7 +758,50 @@ functions:
 
 > **推薦：** 語音 Agent 首選 `qwen/qwen3-next-80b-a3b-instruct`，在工具呼叫判斷（何時該/不該用工具）和語意理解上遠優於 8B 模型。
 
-## 效能參考（DGX Spark aarch64 + qwen3-next-80b）
+## 效能參考
+
+### v3 — Nemotron-3-Nano-Omni (NVFP4, DGX Spark aarch64)
+
+> 測試環境：NVIDIA DGX Spark (GB10, 128GB 統一記憶體)，vLLM OpenAI-compatible API，enable_thinking=false
+
+| 階段 | 延遲 | 備註 |
+|------|------|------|
+| VAD + ASR (SenseVoiceSmall, CPU) | ~0.3-0.5s | ASR 在 CPU 上運行以節省 VRAM |
+| LLM 純對話 TTFT | ~0.2-0.6s | 關閉 reasoning 模式後大幅改善 |
+| LLM + Tool Calling TTFT | ~0.8-2.5s | 依工具複雜度而異 |
+| web_search (Tavily) | ~2-4s | 含外部 API 呼叫 |
+| current_datetime | ~0.5s | 本地工具，極快 |
+| EdgeTTS 合成 | ~0.5-1.0s | |
+| 歷史壓縮 (>10 輪觸發) | +1-3s | 摘要舊對話會增加一次 LLM 呼叫 |
+| **端到端（純對話）** | **~1.0-1.5s** | |
+| **端到端（含工具）** | **~2.0-5.0s** | |
+
+### v3 對話測試結果（18 輪語音互動）
+
+| 測試項目 | 結果 | 說明 |
+|----------|------|------|
+| 打招呼 / 閒聊 | ✅ 正確 | 不觸發工具，繁體中文回覆 |
+| 日期時間查詢 | ✅ 正確 | 正確呼叫 `current_datetime` |
+| 天氣查詢 | ✅ 正確 | 正確呼叫 `web_search`，回傳即時天氣 |
+| 新聞搜尋 | ✅ 正確 | 正確呼叫 `web_search` |
+| 推薦/建議類問題 | ✅ 正確 | 正確呼叫 `web_search` |
+| OpenClaw 深度研究 | ✅ 正確 | 非同步委派成功，背景完成後語音回呼 |
+| 語言一致性 | ⚠️ 偶爾 | 偶爾出現簡體字或英文安全拒答 |
+| 回覆長度控制 | ✅ 正確 | 60 字硬截斷確保語音簡潔 |
+| explain_scene 路由 | ⚠️ 待改善 | 醫療問題偶爾誤觸 explain_scene |
+
+### v3 關鍵優化摘要
+
+| 優化項目 | 措施 | 效果 |
+|----------|------|------|
+| First Token 延遲 | `enable_thinking=false` | 10-14s → 0.2-0.6s |
+| 回覆長度失控 | `max_tokens=200` + 前端 60 字硬截斷 | TTS 播報簡潔不冗長 |
+| Tool Call 被截斷 | `max_tokens` 提高至 200 | 工具 JSON 不再被截斷 |
+| TTS 雜訊 | `_clean_for_tts` 強化 (strip XML/markdown/lists) | 語音乾淨 |
+| 天氣不觸發搜尋 | 修復 `max_tokens` + prompt 強化路由規則 | 穩定觸發 `web_search` |
+| OpenClaw 後端統一 | `~/.openclaw/openclaw.json` 改用 vLLM | 不再需要 Ollama |
+
+### 舊版效能參考（NIM API + qwen3-next-80b）
 
 | 階段 | 延遲 |
 |------|------|
@@ -561,7 +837,9 @@ nat-xiaozhi-voice-agent/
 │   │   └── vad.py                  # Silero VAD 語音活動偵測
 │   ├── tools/                      # 自定義 NAT 工具
 │   │   ├── register.py             # explain_scene 工具註冊（支援 relay / remote / local）
-│   │   └── vlm_camera.py           # VLM 攝影機工具（三種來源自動切換）
+│   │   ├── vlm_camera.py           # VLM 攝影機工具（三種來源自動切換）
+│   │   ├── openclaw_delegate.py    # OpenClaw 委派核心（sync/async 路由、/api/speak 回呼）
+│   │   └── openclaw_register.py    # OpenClaw NAT 工具註冊（含空 message fallback）
 │   ├── utils/
 │   │   ├── audio_codec.py          # Opus 編解碼
 │   │   ├── audio_rate_controller.py # 音訊速率控制

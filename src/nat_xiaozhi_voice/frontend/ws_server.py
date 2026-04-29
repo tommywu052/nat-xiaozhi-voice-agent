@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from nat_xiaozhi_voice.frontend.config import XiaozhiVoiceFrontEndConfig
@@ -103,6 +104,11 @@ class RobotCameraRelay:
 robot_relay = RobotCameraRelay()
 
 
+class SpeakRequest(BaseModel):
+    text: str
+    device_id: str = ""
+
+
 class XiaozhiWSServer:
     """Manages the FastAPI app, pipeline singletons, and active connections."""
 
@@ -162,6 +168,8 @@ class XiaozhiWSServer:
         app.add_api_route("/api/memory", self._list_memory, methods=["GET"])
         app.add_api_route("/api/memory", self._clear_all_memory, methods=["DELETE"])
         app.add_api_route("/api/memory/{device_id:path}", self._clear_device_memory, methods=["DELETE"])
+
+        app.add_api_route("/api/speak", self._speak, methods=["POST"])
 
         # Proxy-friendly routes (no /api/ prefix) for NAT UI access
         app.add_api_route("/memory", self._list_memory, methods=["GET"])
@@ -329,6 +337,29 @@ class XiaozhiWSServer:
             ],
             "count": len(self._connections),
         }
+
+    async def _speak(self, req: SpeakRequest):
+        """POST /api/speak — proactively push TTS to connected client(s)."""
+        if not req.text.strip():
+            return {"status": "error", "message": "text is empty"}
+
+        targets = []
+        if req.device_id:
+            for h in self._connections.values():
+                if h.device_id == req.device_id:
+                    targets.append(h)
+        else:
+            targets = list(self._connections.values())
+
+        if not targets:
+            logger.warning("/api/speak: no connected clients (device_id=%s)", req.device_id or "*")
+            return {"status": "error", "message": "no connected clients"}
+
+        for h in targets:
+            asyncio.create_task(h.speak(req.text))
+
+        logger.info("/api/speak: pushing to %d client(s): %s", len(targets), req.text[:60])
+        return {"status": "ok", "targets": len(targets)}
 
     async def _ws_endpoint(self, ws: WebSocket):
         # Extract device headers (from query params or headers)
